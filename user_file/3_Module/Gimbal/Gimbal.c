@@ -1,7 +1,12 @@
-#include "Gimbal.h"
+﻿#include "Gimbal.h"
 
 #define GIMBAL_CTRL_PERIOD_TICK     1
 #define GIMBAL_CTRL_DT              0.001f
+
+// IMU 数据就绪中断开关：0=纯任务轮询，1=中断唤醒任务（中断里不读SPI）
+#define GIMBAL_IMU_DRDY_ENABLE      1
+// 中断模式下任务等待超时（tick），超时后回退一次轮询读取
+#define GIMBAL_IMU_WAIT_TIMEOUT_TICK 2
 
 // 机械限位（单位：度），用于保护线束
 #define GIMBAL_PITCH_MIN_ANGLE     (-15.0f)
@@ -28,6 +33,7 @@ static float g_gimbal_pitch_zero = 0.0f;
 static float g_gimbal_yaw_zero = 0.0f;
 static uint8_t g_pitch_target_inited = 0;
 static uint8_t g_yaw_target_inited = 0;
+static TaskHandle_t g_gimbal_imu_task_handle = NULL;
 /**
  * @brief   云台角度限幅函数
  * @param  value: 输入角度值（单位：度）
@@ -110,6 +116,11 @@ void Gimbal_Init(void* pramas)
 }
 
 // 云台电机控制任务（1kHz）
+/**
+ * @brief   云台电机控制任务（1kHz）
+ * @param  pramas: 无
+ * @retval 无
+ */
 void Gimbal_Motor_Control_test(void* pramas)
 {
     TickType_t time;
@@ -174,9 +185,31 @@ void Gimbal_Motor_Control_test(void* pramas)
         vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
     }
 }
-//这个地方应该使用中断接收IMU数据
 /**
- * @brief   云台欧拉角任务
+ * @brief   IMU数据就绪外部中断回调（仅做任务通知，不在中断中读SPI）
+ * @param  GPIO_Pin: 触发中断的GPIO引脚
+ * @retval 无
+ */
+void Gimbal_IMU_EXTI_Callback(uint16_t GPIO_Pin)
+{
+#if GIMBAL_IMU_DRDY_ENABLE
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    if ((GPIO_Pin == ACCEL_INT_Pin) || (GPIO_Pin == GYRO_INT_Pin))
+    {
+        if (g_gimbal_imu_task_handle != NULL)
+        {
+            vTaskNotifyGiveFromISR(g_gimbal_imu_task_handle, &xHigherPriorityTaskWoken);
+            portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+        }
+    }
+#else
+    (void)GPIO_Pin;
+#endif
+}
+
+/**
+ * @brief   云台欧拉角任务（1kHz）
  * @param  pramas: 无
  * @retval 无
  */
@@ -186,17 +219,24 @@ void Gimbal_Euler(void *pramas)
 
     (void)pramas;
 
+    g_gimbal_imu_task_handle = xTaskGetCurrentTaskHandle();
     time = xTaskGetTickCount();
 
     while (1)
     {
+#if GIMBAL_IMU_DRDY_ENABLE
+        // 中断模式：等待IMU DRDY通知，超时则回退一次轮询，避免中断异常导致任务停摆
+        (void)ulTaskNotifyTake(pdTRUE, GIMBAL_IMU_WAIT_TIMEOUT_TICK);
+#else
+        // 纯任务轮询模式：固定1kHz节拍
+        vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
+#endif
+
         // 周期采集IMU并更新欧拉角，供视觉发送使用
         BMI088_ReadGyro(&hspi1, &Gimbal_IMU_Data);
         BMI088_ReadAccel(&hspi1, &Gimbal_IMU_Data);
         BMI088_ReadTemp(&hspi1, &Gimbal_IMU_Data);
         Gimbal_Euler_Angle_to_send = BMI088_Complementary_Filter(&Gimbal_IMU_Data, GIMBAL_CTRL_DT, 0.5f, 0.0f);
-
-        vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
     }
 }
 
@@ -244,3 +284,6 @@ void Gimbal_Task(void* pramas)
         vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
     }
 }
+
+
+

@@ -155,6 +155,10 @@ static int8_t CDC_Init_FS(void)
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
+
+  /* 主动使能一次接收，保证CDC初始化后即可接收首包 */
+  (void)USBD_CDC_ReceivePacket(&hUsbDeviceFS);
+
   return (USBD_OK);
   /* USER CODE END 3 */
 }
@@ -291,6 +295,11 @@ uint8_t CDC_Transmit_FS(uint8_t* Buf, uint16_t Len)
   USBD_CDC_HandleTypeDef *hcdc = (USBD_CDC_HandleTypeDef*)hUsbDeviceFS.pClassData;
 
   if ((Buf == NULL) || (Len == 0))
+  {
+    return USBD_FAIL;
+  }
+
+  if (hUsbDeviceFS.dev_state != USBD_STATE_CONFIGURED)
   {
     return USBD_FAIL;
   }

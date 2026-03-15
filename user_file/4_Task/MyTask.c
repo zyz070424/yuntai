@@ -1,13 +1,21 @@
 #include "MyTask.h"
 
 static uint8_t g_task_started = 0;
-
+/**
+ * @brief   任务初始化函数
+ * @param  pramas: 无
+ * @retval 无
+ */
 void Task_Init(void)
 {
     // 设备/模块初始化统一放在任务层入口
     Gimbal_Init(NULL);
 }
-
+/**
+ * @brief   任务循环函数
+ * @param  pramas: 无
+ * @retval 无
+ */
 void Task_loop(void)
 {
     TaskHandle_t task_gimbal_motor_control_handle;

@@ -1,4 +1,4 @@
-#ifndef __GIMBAL_H__
+﻿#ifndef __GIMBAL_H__
 #define __GIMBAL_H__
 
 #include "dvc_vofa.h"
@@ -19,4 +19,6 @@ void Gimbal_Euler(void *pramas);
 void Gimbal_Motor_Control_test(void* pramas);
 void Gimbal_Task(void* pramas);
 void Gimbal_Manifold_Control(void *pramas);
+void Gimbal_IMU_EXTI_Callback(uint16_t GPIO_Pin);
 #endif /* __GIMBAL_H__ */
+
