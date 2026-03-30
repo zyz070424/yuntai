@@ -7,6 +7,7 @@ Manifold_UART_Rx_Data Rx_Data;
  * @brief   manifold USB 接收回调函数
  * @param  Buf: 接收数据缓冲区指针
  * @param  Len: 接收数据长度
+ * @note   非官方
  * @retval 无
  */
 void Manifold_USB_Rx_Callback(uint8_t *Buf, uint32_t Len)
@@ -41,6 +42,8 @@ void Manifold_Init(Manifold_UART_Tx_Data *data, uint8_t Frame_Header, uint8_t Fr
     Rx_Data.Frame_Tail = Frame_End;
 
     USB_Init(Manifold_USB_Rx_Callback);
+    // USB FS帧周期约1ms，这里留2ms发送间隔裕量，降低Busy抖动风险
+    USB_Set_Tx_Min_Interval(2);
 }
 
 /**

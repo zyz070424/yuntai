@@ -65,7 +65,7 @@ typedef struct
     float Gimbal_Yaw_Omega_FeedForward;//云台偏航角速度前馈
     enum Enum_Manifold_Enemy_ID Enemy_ID;//敌方机器人ID
     uint16_t Confidence_Level;//置信度
-}__attribute__((packed))Manifold_UART_Rx_Data;
+}Manifold_UART_Rx_Data;
 
 /**
  * @brief 控制板给视觉Manifold的源数据
@@ -77,10 +77,14 @@ typedef struct
     uint8_t Frame_Tail;//帧尾
     euler_t Euler_Angle;//欧拉角
     enum Enum_Manifold_Sentry_Mode Sentry_Mode;//哨兵模式状态
-}__attribute__((packed))Manifold_UART_Tx_Data;
+}Manifold_UART_Tx_Data;
 
 // 函数声明
 void Manifold_Init(Manifold_UART_Tx_Data* data, uint8_t Frame_Header, uint8_t Frame_End, enum Enum_Manifold_Sentry_Mode Sentry_Mode);
+/**
+ * @brief manifold USB 接收回调函数
+ * @note  非官方
+ */
 void Manifold_USB_Rx_Callback(uint8_t* Buf, uint32_t Len);
 void Manifold_USB_SendData(Manifold_UART_Tx_Data *data , euler_t Euler);
 #endif /*__DVC_MANIFOLD_H__*/

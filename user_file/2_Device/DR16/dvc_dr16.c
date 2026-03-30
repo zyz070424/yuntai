@@ -5,8 +5,13 @@
 static uint8_t g_dr16_frame_buf[2][DR16_FRAME_LEN];
 static volatile uint8_t g_dr16_ready_index = 0;
 static volatile uint8_t g_dr16_has_new_frame = 0;
-
-/* 限幅函数，避免归一化越界 */
+/**
+ * @brief  限幅函数，避免归一化越界
+ * @param  val: 输入值
+ * @param  min_val: 最小允许值
+ * @param  max_val: 最大允许值
+ * @return float: 限幅后的值
+ * */
 static float DR16_Clamp(float val, float min_val, float max_val)
 {
     if (val < min_val)
@@ -20,7 +25,11 @@ static float DR16_Clamp(float val, float min_val, float max_val)
     return val;
 }
 
-/* 开关值合法化 */
+/**
+ * @brief  开关值合法化
+ * @param  sw: 输入开关值
+ * @return uint8_t: 合法化后的开关值
+ * */
 static uint8_t DR16_SanitizeSwitch(uint8_t sw)
 {
     if ((sw == DR16_SWITCH_UP) || (sw == DR16_SWITCH_MIDDLE) || (sw == DR16_SWITCH_DOWN))
@@ -30,7 +39,12 @@ static uint8_t DR16_SanitizeSwitch(uint8_t sw)
     return DR16_SWITCH_MIDDLE;
 }
 
-/* 从双缓冲中取一帧最新数据（无队列） */
+/**
+ * @brief  从双缓冲中取一帧最新数据（无队列）
+ * @param  out_frame: 输出数据缓冲区指针
+ * @return uint8_t: 是否成功获取数据
+ * @retval 无
+ * */
 static uint8_t DR16_FetchLatestFrame(uint8_t *out_frame)
 {
     uint32_t primask;
@@ -65,6 +79,12 @@ static uint8_t DR16_FetchLatestFrame(uint8_t *out_frame)
     return 1;
 }
 
+/**
+ * @brief  DR16 接收回调函数
+ * @param  data: 接收数据缓冲区指针
+ * @param  len: 接收数据长度
+ * @retval 无
+ */
 static void DR16_Receive_Callback(uint8_t *data, uint16_t len)
 {
     uint8_t write_index;
@@ -74,14 +94,20 @@ static void DR16_Receive_Callback(uint8_t *data, uint16_t len)
         return;
     }
 
-    /* 写到非ready缓冲区，完成后再原子切换索引 */
+    /* 写到非ready缓冲区，完成后再原子z切换索引 */
     write_index = (uint8_t)(g_dr16_ready_index ^ 1);
     memcpy(g_dr16_frame_buf[write_index], data, DR16_FRAME_LEN);
     __DMB();
     g_dr16_ready_index = write_index;
     g_dr16_has_new_frame = 1;
 }
-
+/**
+ * @brief  判断开关状态
+ * @param  sw: 输出开关状态指针
+ * @param  now: 当前开关值
+ * @param  prev: 上一开关值
+ * @retval 无
+ * */
 static void JudgeSwitch(DR16_Switch_Status_TypeDef *sw, uint8_t now, uint8_t prev)
 {
     now = DR16_SanitizeSwitch(now);
@@ -136,7 +162,14 @@ static void JudgeSwitch(DR16_Switch_Status_TypeDef *sw, uint8_t now, uint8_t pre
         break;
     }
 }
-
+/** 
+ * @brief  判断按键状态
+ * @param  key: 输出按键状态指针
+ * @param  now: 当前按键值
+ * @param  prev: 上一按键值
+ * @note   非官方
+ * @retval 无
+ * */
 static void JudgeKey(DR16_Key_Status_TypeDef *key, uint8_t now, uint8_t prev)
 {
     if (prev == DR16_KEY_FREE)
@@ -162,7 +195,11 @@ static void JudgeKey(DR16_Key_Status_TypeDef *key, uint8_t now, uint8_t prev)
         }
     }
 }
-
+/**
+ * @brief  初始化DR16
+ * @param  huart: UART句柄指针
+ * @retval 无
+ * */
 void DR16_Init(UART_HandleTypeDef *huart)
 {
     if (huart == NULL)
@@ -232,6 +269,12 @@ void DR16_Process(DR16_DataTypeDef *dr16)
     dr16->mouse_z = DR16_Clamp(mouse_z / 32768.0f, -1.0f, 1.0f);
 }
 
+/**
+ * @brief  DR16 1ms 周期回调函数
+ * @param  dr16: DR16 数据结构体指针
+ * @note   非官方
+ * @retval 无
+ */
 void DR16_Timer1msCallback(DR16_DataTypeDef *dr16)
 {
     uint8_t i;

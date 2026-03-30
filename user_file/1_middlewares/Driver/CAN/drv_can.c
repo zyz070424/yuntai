@@ -1,5 +1,9 @@
 ﻿#include "drv_can.h"
+#include <stdint.h>
+//CAN 联系检查标志位
 
+
+// 双 CAN 管理对象实例
 struct Struct_CAN_Manage_Object CAN1_Manage_Object = {0};
 struct Struct_CAN_Manage_Object CAN2_Manage_Object = {0};
 
@@ -184,6 +188,13 @@ void CAN_Start(CAN_HandleTypeDef *hcan)
 
         manage->Drop_Count = 0;
         manage->Notify_Task_Handle = NULL;
+
+        // 初始化通信存活检测状态
+        // 上电默认离线，直到真正收到过CAN帧才会判定为在线
+        manage->Alive_Flag = 0;
+        manage->Alive_Pre_Flag = 0;
+        manage->Alive_Online = 0;
+        manage->Alive_Changed = 0;
     }
 
     // 总线已启动则直接返回，防止重复调用 HAL_CAN_Start
@@ -267,6 +278,7 @@ void CAN_Send(CAN_HandleTypeDef *hcan, uint32_t Send_id, uint8_t *data)
 /** 
  * @brief  CAN 接收回调函数
  * @param  hcan: CAN句柄
+ * @note   非官方
  * @retval 无
  */
 void CAN_Receive_Callback(CAN_HandleTypeDef *hcan)
@@ -289,6 +301,10 @@ void CAN_Receive_Callback(CAN_HandleTypeDef *hcan)
             break;
         }
 
+        // 收到有效CAN帧，更新Alive计数
+        // 该计数只在中断中递增，任务层每100ms比较是否增长来判断断联
+        manage->Alive_Flag++;
+
         if (manage->Rx_Length_Active < CAN_RX_BUFFER_SIZE)
         {
             uint16_t write_index = manage->Rx_Length_Active;
@@ -301,11 +317,12 @@ void CAN_Receive_Callback(CAN_HandleTypeDef *hcan)
             // Active 缓冲写满，统计丢帧
             manage->Drop_Count++;
         }
+
     }
 
     CAN_Publish_Active_To_Ready(manage);
 
-    // 可选通知：Ready 就绪后唤醒任务，本来是使用任务通知的设计，但是这里用任务通知更方便，但是还是保留设计
+    // 可选通知：Ready 就绪后唤醒任务，本来是使用任务通知的设计，但是这里用回调函数更方便，但是还是保留设计
     if (manage->Rx_Length_Ready > 0 && manage->Notify_Task_Handle != NULL)
     {
         vTaskNotifyGiveFromISR(manage->Notify_Task_Handle, &xHigherPriorityTaskWoken);
@@ -402,6 +419,86 @@ HAL_StatusTypeDef CAN_ReadMessage_By_StdId(CAN_HandleTypeDef *hcan, uint32_t std
     return HAL_ERROR;
 }
 
+/**
+ * @brief  100ms周期检查CAN链路是否在线（Flag/Pre_Flag机制）
+ * @param  hcan: CAN句柄
+ * @retval 无
+ * @note   判定规则：
+ *         - 本周期Alive_Flag有增长：在线
+ *         - 本周期Alive_Flag无增长：离线
+ *         仅在状态发生变化时置Alive_Changed，供任务层检查
+ */
+void CAN_Alive_Check_100ms(CAN_HandleTypeDef *hcan)
+{
+    struct Struct_CAN_Manage_Object *manage = CAN_Get_Manage_Object(hcan);
+    uint8_t online_new;
+
+    if (manage == NULL)
+    {
+        return;
+    }
+
+    online_new = (uint8_t)(manage->Alive_Flag != manage->Alive_Pre_Flag);
+    manage->Alive_Pre_Flag = manage->Alive_Flag;
+
+    if (online_new != manage->Alive_Online)
+    {
+        manage->Alive_Online = online_new;
+        manage->Alive_Changed = 1;
+    }
+}
+
+/**
+ * @brief  获取当前CAN链路在线状态
+ * @param  hcan: CAN句柄
+ * @retval 0=离线 1=在线
+ */
+uint8_t CAN_Alive_IsOnline(CAN_HandleTypeDef *hcan)
+{
+    struct Struct_CAN_Manage_Object *manage = CAN_Get_Manage_Object(hcan);
+
+    if (manage == NULL)
+    {
+        return 0;
+    }
+
+    return manage->Alive_Online;
+}
+
+/**
+ * @brief  任务层检查一次“在线状态变化事件”
+ * @param  hcan: CAN句柄
+ * @param  online: 输出当前在线状态（可为NULL）
+ * @retval 0=无变化 1=有变化
+ * @note   该函数建议在任务上下文调用
+ */
+uint8_t CAN_Alive_TryConsumeChanged(CAN_HandleTypeDef *hcan, uint8_t *online)
+{
+    struct Struct_CAN_Manage_Object *manage = CAN_Get_Manage_Object(hcan);
+    uint8_t changed;
+
+    if (manage == NULL)
+    {
+        return 0;
+    }
+
+    taskENTER_CRITICAL();
+
+    changed = manage->Alive_Changed;
+    if (changed != 0)
+    {
+        manage->Alive_Changed = 0;
+        if (online != NULL)
+        {
+            *online = manage->Alive_Online;
+        }
+    }
+
+    taskEXIT_CRITICAL();
+
+    return changed;
+}
+
 /*
  * @brief  CAN 接收中断回调函数
  * @param  hcan: CAN句柄
@@ -410,4 +507,6 @@ HAL_StatusTypeDef CAN_ReadMessage_By_StdId(CAN_HandleTypeDef *hcan, uint32_t std
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 {
     CAN_Receive_Callback(hcan);
+    
+    
 }

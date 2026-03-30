@@ -87,6 +87,10 @@ typedef struct
 
 void DR16_Init(UART_HandleTypeDef *huart);
 void DR16_Process(DR16_DataTypeDef *dr16);
+/**
+ * @brief DR16 1ms 周期回调函数
+ * @note  非官方
+ */
 void DR16_Timer1msCallback(DR16_DataTypeDef *dr16);
 
 #endif /* __DVC_DR16_H__ */

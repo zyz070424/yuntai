@@ -334,7 +334,7 @@ void Motor_CAN_Data_Receive(Motor_TypeDef *motor)
         default:
             return;
     }
-
+    //有一个寻循环雷点
     // 仅提取当前电机对应ID的数据，不会误消费其他电机帧
     // 周期任务中一次尽量读空该ID，减少反馈滞后
     while (CAN_ReadMessage_By_StdId(motor->can, feedback_id, &RxBuffer) == HAL_OK)
@@ -354,6 +354,7 @@ void Motor_CAN_Data_Receive(Motor_TypeDef *motor)
                 return;
         }
     }
+    
 }
 
 /**

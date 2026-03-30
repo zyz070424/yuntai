@@ -19,6 +19,10 @@ void Gimbal_Euler(void *pramas);
 void Gimbal_Motor_Control_test(void* pramas);
 void Gimbal_Task(void* pramas);
 void Gimbal_Manifold_Control(void *pramas);
+/**
+ * @brief IMU 数据就绪外部中断回调
+ * @note  非官方
+ */
 void Gimbal_IMU_EXTI_Callback(uint16_t GPIO_Pin);
 #endif /* __GIMBAL_H__ */
 

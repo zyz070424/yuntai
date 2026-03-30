@@ -2,6 +2,13 @@
 
 static char tail[4] = {0x00, 0x00, 0x80, 0x7f};
 
+/**
+ * @brief  VOFA 接收回调函数
+ * @param  data: 接收数据缓冲区指针
+ * @param  len: 接收数据长度
+ * @note   非官方
+ * @retval 无
+ */
 void VOFA_Callback( uint8_t *data, uint16_t len)
 {   
     
