@@ -1,4 +1,5 @@
 ﻿#include "dvc_bmi088.h"
+#include "alg_quaternion.h"
 #include "task.h"
 
 #define BMI088_OK_OR_RETURN(x) do { if ((x) != HAL_OK) return HAL_ERROR; } while (0)
@@ -173,3 +174,4 @@ euler_t BMI088_Complementary_Filter(imu_data_t *data, float dt, float kp, float 
 
     return euler;
 }
+

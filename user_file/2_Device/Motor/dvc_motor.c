@@ -1,7 +1,8 @@
 ﻿#include "dvc_motor.h"
+#include "stm32_hal_legacy.h"
 #include <stdint.h>
 #include <string.h>
-
+#include <math.h>
 typedef struct
 {
     uint8_t frame_0x200[8];
@@ -185,6 +186,7 @@ void Motor_Set_PID_Params(Motor_TypeDef *motor, uint8_t pid_index,
  */
 float Motor_PID_Calculate(Motor_TypeDef *motor, float target, float feedback_angle, float dt)
 {
+    
     if (motor == NULL)
         return 0.0f;
 
@@ -198,7 +200,7 @@ float Motor_PID_Calculate(Motor_TypeDef *motor, float target, float feedback_ang
         {
             // 级联PID：外环角度PID -> 内环速度PID
             // 外环：目标角度 vs 当前角度，输出为目标速度
-            float target_speed = PID_Calculate(&motor->PID[0], feedback_angle, target, dt);
+            float target_speed= PID_Calculate(&motor->PID[0], feedback_angle, target, dt);
             // 内环：目标速度 vs 当前速度，输出为最终电流
             return PID_Calculate(&motor->PID[1], (float)motor->RxData.Speed, target_speed, dt);
         }
@@ -286,7 +288,12 @@ static void Motor_M3508_Data_Process(Motor_TypeDef *motor, uint8_t *data)
     motor->RxData.Total_Encode = motor->RxData.Total_Round * Encoder_Num_Per_Round + Encoder_Angle;
     motor->RxData.Angle = (float)motor->RxData.Total_Encode * 360.0f / (float)Encoder_Num_Per_Round / M2508_Gearbox_Rate;
 }
-
+/**
+ * @brief 限制角度目标值在指定范围内
+ * @param motor 电机结构体指针
+ * @param min 最小角度（deg）
+ * @param max 最大角度（deg）
+ */
 void Motor_Angle_Limit(Motor_TypeDef *motor,float min,float max)
 {
     PID_Target_Limit_Enable(&motor->PID[0],true,min,max);
@@ -299,6 +306,10 @@ void Motor_Angle_Limit(Motor_TypeDef *motor,float min,float max)
        motor->PID[0].target = max;
     }
 }
+
+
+
+    
 
 /**
  * @brief 接收电机CAN数据（按ID从CAN双缓冲中提取）
@@ -314,7 +325,7 @@ void Motor_CAN_Data_Receive(Motor_TypeDef *motor)
         return;
     }
 
-    if (motor->ID < 1 || motor->ID > 8)
+    if (motor->ID < 1 || motor->ID > 7)
     {
         return;
     }
@@ -369,7 +380,7 @@ void Motor_Send_CAN_Data(Motor_TypeDef *motor, int16_t data)
         return;
     }
 
-    if (motor->ID < 1 || motor->ID > 8)
+    if (motor->ID < 1 || motor->ID > 7)
     {
         return;
     }
@@ -399,10 +410,7 @@ void Motor_Send_CAN_Data(Motor_TypeDef *motor, int16_t data)
                     break;
                 case 7:
                     Motor_Update_Frame_And_Send(motor, 0x1FF, 4, data);
-                    break;
-                case 8:
-                    Motor_Update_Frame_And_Send(motor, 0x1FF, 6, data);
-                    break;
+                    break; 
                 default:
                     break;
             }
@@ -432,9 +440,6 @@ void Motor_Send_CAN_Data(Motor_TypeDef *motor, int16_t data)
                 case 7:
                     Motor_Update_Frame_And_Send(motor, 0x2FF, 4, data);
                     break;
-                case 8:
-                    Motor_Update_Frame_And_Send(motor, 0x2FF, 6, data);
-                    break;
                 default:
                     break;
             }
@@ -463,9 +468,6 @@ void Motor_Send_CAN_Data(Motor_TypeDef *motor, int16_t data)
                     break;
                 case 7:
                     Motor_Update_Frame_And_Send(motor, 0x2FE, 4, data);
-                    break;
-                case 8:
-                    Motor_Update_Frame_And_Send(motor, 0x2FE, 6, data);
                     break;
                 default:
                     break;

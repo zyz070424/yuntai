@@ -1,4 +1,6 @@
 ﻿#include "Gimbal.h"
+#include "dvc_motor.h"
+#include "portmacro.h"
 
 #define GIMBAL_CTRL_PERIOD_TICK     1
 #define GIMBAL_CTRL_DT              0.001f
@@ -9,13 +11,13 @@
 #define GIMBAL_IMU_WAIT_TIMEOUT_TICK 2
 
 // 机械限位（单位：度），用于保护线束
-#define GIMBAL_PITCH_MIN_ANGLE     (-15.0f)
-#define GIMBAL_PITCH_MAX_ANGLE     (30.0f)
+#define GIMBAL_PITCH_MIN_ANGLE     (-42.0f)
+#define GIMBAL_PITCH_MAX_ANGLE     (42.0f)
 #define GIMBAL_YAW_MIN_ANGLE       (-120.0f)
 #define GIMBAL_YAW_MAX_ANGLE       (120.0f)
 
 // 电机输出限幅（GM6020电压模式常用范围）
-#define GIMBAL_MOTOR_CMD_LIMIT      12000.0f
+#define GIMBAL_MOTOR_CMD_LIMIT      3000.0f
 
 // 单次视觉增量限幅，防止异常包导致目标突变
 #define GIMBAL_VISION_INC_LIMIT     2.0f
@@ -34,123 +36,6 @@ static float g_gimbal_yaw_zero = 0.0f;
 static uint8_t g_pitch_target_inited = 0;
 static uint8_t g_yaw_target_inited = 0;
 static TaskHandle_t g_gimbal_imu_task_handle = NULL;
-
-/**
- * @brief   状态灯模式定义
- * @note    当前实现CAN/SPI/USB三路灯语：
- *          - All_Online：慢速心跳
- *          - CAN_Offline：快速闪烁（高优先级）
- *          - SPI_Offline：中速闪烁
- *          - USB_Offline：长亮短灭
- */
-enum Enum_Status_LED_Mode
-{
-    Status_LED_Mode_All_Online = 0,
-    Status_LED_Mode_CAN_Offline,
-    Status_LED_Mode_SPI_Offline,
-    Status_LED_Mode_USB_Offline,
-};
-
-/**
- * @brief   状态灯闪烁参数
- * @param   on_time_ms: 亮灯时长（ms）
- * @param   off_time_ms: 灭灯时长（ms）
- */
-typedef struct
-{
-    uint16_t on_time_ms;
-    uint16_t off_time_ms;
-} Status_LED_Pattern_TypeDef;
-
-// 默认上电先按CAN离线模式显示，直到检测到链路在线
-static volatile enum Enum_Status_LED_Mode g_status_led_mode = Status_LED_Mode_CAN_Offline;
-// 当前闪烁周期内的相位计数（ms）
-static uint16_t g_status_led_phase_ms = 0;
-// 四种模式对应闪烁节奏
-static const Status_LED_Pattern_TypeDef g_status_led_pattern[4] =
-{
-    {50, 950},   // 全在线：心跳
-    {120, 120},  // CAN离线：快闪
-    {300, 300},  // SPI离线：中速闪烁
-    {700, 200},  // USB离线：长亮短灭
-};
-
-/**
- * @brief   状态灯底层输出接口（弱定义）
- * @param   state: 0=灭灯，1=亮灯
- * @retval  无
- * @note    你可以在其他文件里实现同名强符号，绑定到实际GPIO口
- */
-__weak void Gimbal_Status_LED_Write(uint8_t state)
-{
-    (void)state;
-}
-
-/**
- * @brief   设置状态灯当前模式
- * @param   mode: 目标模式
- * @retval  无
- */
-static void Gimbal_Status_LED_Set_Mode(enum Enum_Status_LED_Mode mode)
-{
-    g_status_led_mode = mode;
-}
-
-/**
- * @brief   根据CAN/SPI/USB在线状态选择灯语模式（表驱动）
- * @param   can_online: CAN是否在线（0/1）
- * @param   spi_online: SPI是否在线（0/1）
- * @param   usb_online: USB是否在线（0/1）
- * @retval  状态灯模式
- * @note    优先级：CAN离线 > SPI离线 > USB离线 > 全在线
- */
-static enum Enum_Status_LED_Mode Gimbal_Status_LED_Select_Mode(uint8_t can_online, uint8_t spi_online, uint8_t usb_online)
-{
-    // bit0: CAN离线，bit1: SPI离线，bit2: USB离线
-    uint8_t fault_mask = (uint8_t)((can_online == 0) | ((spi_online == 0) << 1) | ((usb_online == 0) << 2));
-    static const enum Enum_Status_LED_Mode mode_map[8] =
-    {
-        Status_LED_Mode_All_Online,  // 000
-        Status_LED_Mode_CAN_Offline, // 001
-        Status_LED_Mode_SPI_Offline, // 010
-        Status_LED_Mode_CAN_Offline, // 011
-        Status_LED_Mode_USB_Offline, // 100
-        Status_LED_Mode_CAN_Offline, // 101
-        Status_LED_Mode_SPI_Offline, // 110
-        Status_LED_Mode_CAN_Offline  // 111
-    };
-
-    return mode_map[fault_mask];
-}
-
-/**
- * @brief   10ms周期更新一次状态灯输出
- * @param   无
- * @retval  无
- * @note    本函数不阻塞、不延时，只按相位推进输出
- */
-static void Gimbal_Status_LED_Update_10ms(void)
-{
-    Status_LED_Pattern_TypeDef pattern = g_status_led_pattern[g_status_led_mode];
-    uint16_t period_ms = (uint16_t)(pattern.on_time_ms + pattern.off_time_ms);
-    uint16_t pos_ms = 0;
-
-    // 防御性保护：防止后续误改造成周期为0
-    if (period_ms == 0)
-    {
-        Gimbal_Status_LED_Write(0);
-        return;
-    }
-
-    pos_ms = (uint16_t)(g_status_led_phase_ms % period_ms);
-    Gimbal_Status_LED_Write((uint8_t)(pos_ms < pattern.on_time_ms));
-
-    g_status_led_phase_ms = (uint16_t)(g_status_led_phase_ms + 10);
-    if (g_status_led_phase_ms >= period_ms)
-    {
-        g_status_led_phase_ms = 0;
-    }
-}
 
 /**
  * @brief   CAN断联保护动作
@@ -179,6 +64,7 @@ static void Gimbal_CAN_Offline_Protect(void)
  */
 static void Gimbal_CAN_Online_Protect(void)
 {
+
 }
 
 /**
@@ -302,10 +188,10 @@ void Gimbal_Init(void* pramas)
     (void)pramas;
 
     // 初始化视觉通信
-    Manifold_Init(&Tx_Data, 0xA5, 0x5A, Manifold_Sentry_Mode_DISABLE);
+    Manifold_Init(&Tx_Data, 0xFE, 0xFF, Manifold_Sentry_Mode_DISABLE);
 
     // 启动电机所在CAN总线
-    CAN_Start(&hcan1);
+    CAN_Start(&hcan2);
 
     // 初始化IMU
     if (BMI088_Init(&hspi1) != HAL_OK)
@@ -314,22 +200,22 @@ void Gimbal_Init(void* pramas)
     }
 
     // 俯仰电机：角度外环 + 速度内环
-    Motor_Init(&Gimbal_Motor_Pitch, 1, GM6020_Voltage, &hcan1, DJI_Control_Method_Angle);
-    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 0, 0.20f, 0.00f, 0.00f, 0.00f, -6.0f, 6.0f, -1.0f, 1.0f);
-    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 1, 1800.0f, 20.0f, 0.0f, 0.0f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f, 3000.0f);
+    Motor_Init(&Gimbal_Motor_Pitch, 4, GM6020_Voltage, &hcan2, DJI_Control_Method_Angle);
+    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 0, 0.00f, 0.00f, 0.00f, 0.00f, -6.0f, 6.0f, -1.0f, 1.0f);
+    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 1, 0.00f, 0.00f, 0.00f, 0.00f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f, 3000.0f);
 
     // 偏航电机：角度外环 + 速度内环
-    Motor_Init(&Gimbal_Motor_Yaw, 2, GM6020_Voltage, &hcan1, DJI_Control_Method_Angle);
-    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 0, 0.20f, 0.00f, 0.00f, 0.00f, -6.0f, 6.0f, -1.0f, 1.0f);
-    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 1, 1800.0f, 20.0f, 0.0f, 0.0f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f, 3000.0f);
+    Motor_Init(&Gimbal_Motor_Yaw, 2, GM6020_Voltage, &hcan2, DJI_Control_Method_Angle);
+    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 0, 0.00f, 0.00f, 0.00f, 0.00f, -6.0f, 6.0f, -1.0f, 1.0f);
+    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 1, 0.00f, 0.00f, 0.00f, 0.00f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f, 3000.0f);
 
-    // 清零目标和零点，等待电机首帧反馈后锁定
-    g_gimbal_pitch_target = 0.0f;
-    g_gimbal_yaw_target = 0.0f;
-    g_gimbal_pitch_zero = 0.0f;
-    g_gimbal_yaw_zero = 0.0f;
-    g_pitch_target_inited = 0;
-    g_yaw_target_inited = 0;
+    // // 清零目标和零点，等待电机首帧反馈后锁定，还在商讨怎么控制，先做保留
+    // g_gimbal_pitch_target = 0.0f;
+    // g_gimbal_yaw_target = 0.0f;
+    // g_gimbal_pitch_zero = 0.0f;
+    // g_gimbal_yaw_zero = 0.0f;
+    // g_pitch_target_inited = 0;
+    // g_yaw_target_inited = 0;
 }
 
 // 云台电机控制任务（1kHz）
@@ -365,7 +251,7 @@ void Gimbal_Motor_Control_test(void* pramas)
         Motor_CAN_Data_Receive(&Gimbal_Motor_Yaw);
 
         // 首帧反馈后记录零点，后续使用相对角度闭环
-        if ((g_pitch_target_inited == 0) && (Gimbal_Motor_Pitch.RxData.Encoder_Initialized != 0))
+        if ((g_pitch_target_inited == 1) && (Gimbal_Motor_Pitch.RxData.Encoder_Initialized != 0))
         {
             g_gimbal_pitch_zero = Gimbal_Motor_Pitch.RxData.Angle;
             g_gimbal_pitch_target = 0.0f;
@@ -379,7 +265,7 @@ void Gimbal_Motor_Control_test(void* pramas)
             g_yaw_target_inited = 1;
         }
 
-        // 视觉给的是角度增量，本周期按增量叠加目标角
+        //视觉给的是角度增量，本周期按增量叠加目标角
         pitch_inc = Gimbal_Clamp(Rx_Data.Gimbal_Pitch_Angle_Increment, -GIMBAL_VISION_INC_LIMIT, GIMBAL_VISION_INC_LIMIT);
         yaw_inc = Gimbal_Clamp(Rx_Data.Gimbal_Yaw_Angle_Increment, -GIMBAL_VISION_INC_LIMIT, GIMBAL_VISION_INC_LIMIT);
 
@@ -403,10 +289,66 @@ void Gimbal_Motor_Control_test(void* pramas)
 
         // 根据链路在线状态选择输出策略：
         // 离线 -> 固定输出0；在线 -> 正常输出PID结果
-        can_online = CAN_Alive_IsOnline(&hcan1);
+        can_online = CAN_Alive_IsOnline(&hcan2);
         Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, can_output_map[can_online](pitch_output));
         Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, can_output_map[can_online](yaw_output));
+        
+        vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
+    }
+}
 
+
+/**
+ * @brief   Yaw PID测试任务（通用模板，1kHz）
+ * @param  params: 无
+ * @retval 无
+ * @note    该函数仅闭环Yaw轴，便于单轴PID联调
+ */
+void Gimbal_Motor_Control_ALL_Test(void* params)
+{
+    TickType_t time;
+    uint8_t can_online;
+    float pitch_feedback;
+    float pitch_output;
+    float yaw_output;
+    float yaw_feedback;
+    (void)params;
+
+    time = xTaskGetTickCount();
+
+    while (1)
+    {
+        // 刷新所有pitch反馈
+        Motor_CAN_Data_Receive(&Gimbal_Motor_Pitch);
+        pitch_feedback = Gimbal_Motor_Pitch.RxData.Angle;
+        // 刷新Yaw反馈
+        Motor_CAN_Data_Receive(&Gimbal_Motor_Yaw);
+        yaw_feedback = Gimbal_Motor_Yaw.RxData.Angle;
+
+        // 做Pitch单轴PID
+        pitch_output = Motor_PID_Calculate(&Gimbal_Motor_Pitch, g_gimbal_pitch_target, pitch_feedback, GIMBAL_CTRL_DT);
+        pitch_output = Gimbal_Clamp(pitch_output, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT);
+        // 做Yaw单轴PID
+        yaw_output = Motor_PID_Calculate(&Gimbal_Motor_Yaw, g_gimbal_yaw_target, yaw_feedback, GIMBAL_CTRL_DT);
+        yaw_output = Gimbal_Clamp(yaw_output, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT);
+        // CAN离线保护：离线发0，在线发PID输出
+        can_online = CAN_Alive_IsOnline(&hcan2);
+        if (can_online != 0)
+        {
+            Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, Gimbal_Output_To_CAN_Normal(pitch_output));
+        }
+        else
+        {
+            Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, Gimbal_Output_To_CAN_Zero(0.0f));
+        }   
+        if (can_online != 0)
+        {
+            Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, Gimbal_Output_To_CAN_Normal(yaw_output));
+        }
+        else
+        {
+            Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, Gimbal_Output_To_CAN_Zero(0.0f));
+        }
         vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
     }
 }
@@ -499,13 +441,10 @@ void Gimbal_Task(void* pramas)
 {
     TickType_t time;
     uint16_t alive_check_div = 0;
-    uint16_t led_update_div = 0;
     uint8_t can_online_changed;
     uint8_t spi_online_changed;
     uint8_t usb_online_changed;
-    uint8_t can_online;
-    uint8_t spi_online;
-    uint8_t usb_online;
+   
     static void (* const can_link_action[2])(void) =
     {
         Gimbal_CAN_Offline_Protect,
@@ -532,13 +471,13 @@ void Gimbal_Task(void* pramas)
         if (++alive_check_div >= 100)
         {
             alive_check_div = 0;
-            CAN_Alive_Check_100ms(&hcan1);
+            CAN_Alive_Check_100ms(&hcan2);
             SPI_Alive_Check_100ms();
             USB_Alive_Check_100ms();
         }
 
         // 若检测到CAN在线状态发生变化，在任务层执行对应保护动作
-        if (CAN_Alive_TryConsumeChanged(&hcan1, &can_online_changed) != 0)
+        if (CAN_Alive_TryConsumeChanged(&hcan2, &can_online_changed) != 0)
         {
             can_link_action[can_online_changed]();
         }
@@ -554,20 +493,7 @@ void Gimbal_Task(void* pramas)
         {
             usb_link_action[usb_online_changed]();
         }
-
-        // 每个周期按当前链路状态选择灯语模式
-        can_online = CAN_Alive_IsOnline(&hcan1);
-        spi_online = SPI_Alive_IsOnline();
-        usb_online = USB_Alive_IsOnline();
-        Gimbal_Status_LED_Set_Mode(Gimbal_Status_LED_Select_Mode(can_online, spi_online, usb_online));
-
-        // 每10ms刷新一次状态灯输出
-        if (++led_update_div >= 10)
-        {
-            led_update_div = 0;
-            Gimbal_Status_LED_Update_10ms();
-        }
-
+       
         vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
     }
 }

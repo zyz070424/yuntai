@@ -17,6 +17,7 @@
 void Gimbal_Init(void* pramas);
 void Gimbal_Euler(void *pramas);
 void Gimbal_Motor_Control_test(void* pramas);
+void Gimbal_Motor_Control_ALL_Test(void* pramas);
 void Gimbal_Task(void* pramas);
 void Gimbal_Manifold_Control(void *pramas);
 /**

@@ -100,26 +100,28 @@ static inline quat_t quat_integrate(quat_t q, vec3_t gyro, float dt)
 /**
  * @brief 四元数转欧拉角
  * @return 角度制（deg）
+ * @note 这里本来是按照bmi088的手册解算的，但是ACE的解算结果和bmi088的解算结果有差异，所以这里用ACE的解算结果，也就是pitch和roll的顺序对调。
+ *       我的解算的顺序是按bmi088的ZYX，但是ACE的Pitch和Roll都不会万向锁。
  */
 euler_t quat_to_euler(quat_t q)
 {
     euler_t euler;
 
-    // Roll (X)
+    // Roll (X),但是ACE的pitch
     float sinr_cosp = 2.0f * (q.w * q.x + q.y * q.z);
     float cosr_cosp = 1.0f - 2.0f * (q.x * q.x + q.y * q.y);
-    euler.roll = atan2f(sinr_cosp, cosr_cosp);
+    euler.pitch = atan2f(sinr_cosp, cosr_cosp);
 
-    // Pitch (Y)
+    // Pitch (Y)，但是是ACE的roll
     float sinp = 2.0f * (q.w * q.y - q.z * q.x);
     if (fabsf(sinp) >= 1.0f)
     {
         // 防止 asin 超界，处理接近万向锁情况
-        euler.pitch = copysignf(M_PI / 2.0f, sinp);
+        euler.roll = copysignf(M_PI / 2.0f, sinp);
     }
     else
     {
-        euler.pitch = asinf(sinp);
+        euler.roll = asinf(sinp);
     }
 
     // Yaw (Z)
