@@ -1,5 +1,4 @@
 ﻿#include "dvc_motor.h"
-#include "stm32_hal_legacy.h"
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
@@ -113,6 +112,7 @@ static void Motor_Update_Frame_And_Send(Motor_TypeDef *motor, uint32_t send_id, 
  * @param type 电机类型
  * @param can CAN句柄
  * @param method 控制方法
+ * @note 默认pid结构体的0为内环/单级PID，1为外环/双级PID，根据method方法动态分配
  */
 void Motor_Init(Motor_TypeDef *motor, uint8_t ID, enum Motor_DJI_type type,
                 CAN_HandleTypeDef *can, enum Motor_DJI_Control_Method method)
@@ -142,9 +142,9 @@ void Motor_Init(Motor_TypeDef *motor, uint8_t ID, enum Motor_DJI_type type,
 
         case DJI_Control_Method_Angle:
             motor->PID_Use_Count = 2;
-            // 外环角度PID
-            PID_Init(&motor->PID[0]);
             // 内环速度PID
+            PID_Init(&motor->PID[0]);
+            // 外环角度PID
             PID_Init(&motor->PID[1]);
             break;
 
@@ -157,7 +157,7 @@ void Motor_Init(Motor_TypeDef *motor, uint8_t ID, enum Motor_DJI_type type,
 /**
  * @brief 设置电机PID参数（系数和限幅）
  * @param motor 电机结构体指针
- * @param pid_index PID索引（0:外环/单级, 1:内环）
+ * @param pid_index PID索引（0:内环/单级速度环, 1:外环角度环）
  * @param p 比例系数
  * @param i 积分系数
  * @param d 微分系数
@@ -172,9 +172,48 @@ void Motor_Set_PID_Params(Motor_TypeDef *motor, uint8_t pid_index,
                           float out_min, float out_max,
                           float integral_min, float integral_max)
 {
+    if (motor == NULL || pid_index >= 2)
+    {
+        return;
+    }
+
     PID_Set_Parameters(&motor->PID[pid_index], p, i, d, feedforward, integral_min, integral_max, out_min, out_max);
 }
 
+
+/**
+ * @brief 计算电机速度控制量（根据当前速度和目标速度）
+ * @param motor 电机结构体指针
+ * @param target 目标速度（单位：弧度/秒）
+ * @param feedback_speed 当前速度（单位：弧度/秒）
+ * @param dt 时间间隔（单位：秒）
+ * @return 速度控制量（单位：电流）
+ */
+float Motor_PID_Calculate_Speed(Motor_TypeDef *motor, float target, float feedback_speed, float dt)
+{
+    
+    if (motor == NULL)
+        return 0.0f;
+
+    // 速度内环固定使用 PID[0]
+    return PID_Calculate(&motor->PID[0], feedback_speed, target, dt);
+}
+/**
+ * @brief 计算电机角度控制量（根据当前角度和目标角度）
+ * @param motor 电机结构体指针
+ * @param target 目标角度（单位：度）
+ * @param feedback_angle 当前角度（单位：度）
+ * @param dt 时间间隔（单位：秒）
+ * @return 角度控制量（单位：电流）
+ */
+float Motor_PID_Calculate_Angle(Motor_TypeDef *motor, float target, float feedback_angle, float dt)
+{
+    if (motor == NULL)
+        return 0.0f;
+
+    // 角度外环固定使用 PID[1]
+    return PID_Calculate(&motor->PID[1], feedback_angle, target, dt);
+}
 
 /**
  * @brief 电机PID计算（自动选择单级或级联模式）
@@ -186,7 +225,6 @@ void Motor_Set_PID_Params(Motor_TypeDef *motor, uint8_t pid_index,
  */
 float Motor_PID_Calculate(Motor_TypeDef *motor, float target, float feedback_angle, float dt)
 {
-    
     if (motor == NULL)
         return 0.0f;
 
@@ -200,17 +238,15 @@ float Motor_PID_Calculate(Motor_TypeDef *motor, float target, float feedback_ang
         {
             // 级联PID：外环角度PID -> 内环速度PID
             // 外环：目标角度 vs 当前角度，输出为目标速度
-            float target_speed= PID_Calculate(&motor->PID[0], feedback_angle, target, dt);
+            float target_speed = PID_Calculate(&motor->PID[1], feedback_angle, target, dt);
             // 内环：目标速度 vs 当前速度，输出为最终电流
-            return PID_Calculate(&motor->PID[1], (float)motor->RxData.Speed, target_speed, dt);
+            return PID_Calculate(&motor->PID[0], (float)motor->RxData.Speed, target_speed, dt);
         }
 
         default:
             return 0.0f;
     }
 }
-
-
 /**
  * @brief 处理GM6020原始数据（字节解析）
  * @param motor 电机结构体指针
@@ -296,14 +332,20 @@ static void Motor_M3508_Data_Process(Motor_TypeDef *motor, uint8_t *data)
  */
 void Motor_Angle_Limit(Motor_TypeDef *motor,float min,float max)
 {
-    PID_Target_Limit_Enable(&motor->PID[0],true,min,max);
-    if(motor->PID[0].target < min)
+    if (motor == NULL)
     {
-       motor->PID[0].target = min;
+        return;
     }
-    else if(motor->PID[0].target > max)
+
+    // 外环角度PID固定使用 PID[1]
+    PID_Target_Limit_Enable(&motor->PID[1],true,min,max);
+    if(motor->PID[1].target < min)
     {
-       motor->PID[0].target = max;
+       motor->PID[1].target = min;
+    }
+    else if(motor->PID[1].target > max)
+    {
+       motor->PID[1].target = max;
     }
 }
 

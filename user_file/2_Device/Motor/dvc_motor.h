@@ -66,7 +66,9 @@ void Motor_Set_PID_Params(Motor_TypeDef *motor, uint8_t pid_index,
                           float p, float i, float d, float feedforward,
                           float out_min, float out_max,
                           float integral_min, float integral_max);
-float Motor_PID_Calculate(Motor_TypeDef *motor, float target, float feedback_angle, float dt);
+float Motor_PID_Calculate_Speed(Motor_TypeDef *motor, float target, float feedback_speed, float dt);
+float Motor_PID_Calculate_Angle(Motor_TypeDef *motor, float target, float feedback_angle, float dt);
+float Motor_PID_Calculate(Motor_TypeDef *motor, float target, float feedback, float dt);
 void Motor_CAN_Data_Receive(Motor_TypeDef *motor);
 void Motor_Send_CAN_Data(Motor_TypeDef *motor, int16_t data);
 #endif /* __MOTOR_H__ */

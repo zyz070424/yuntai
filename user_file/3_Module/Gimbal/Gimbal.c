@@ -1,6 +1,7 @@
 ﻿#include "Gimbal.h"
 #include "dvc_motor.h"
 #include "portmacro.h"
+#include <stdint.h>
 
 #define GIMBAL_CTRL_PERIOD_TICK     1
 #define GIMBAL_CTRL_DT              0.001f
@@ -22,6 +23,11 @@
 // 单次视觉增量限幅，防止异常包导致目标突变
 #define GIMBAL_VISION_INC_LIMIT     2.0f
 
+// 运行时锁零掩码：支持按轴选择
+#define GIMBAL_ZERO_LOCK_PITCH      (1 << 0)
+#define GIMBAL_ZERO_LOCK_YAW        (1 << 1)
+#define GIMBAL_ZERO_LOCK_BOTH       (GIMBAL_ZERO_LOCK_PITCH | GIMBAL_ZERO_LOCK_YAW)
+
 Motor_TypeDef Gimbal_Motor_Pitch;
 Motor_TypeDef Gimbal_Motor_Yaw;
 imu_data_t Gimbal_IMU_Data;
@@ -33,10 +39,9 @@ static float g_gimbal_pitch_target = 0.0f;
 static float g_gimbal_yaw_target = 0.0f;
 static float g_gimbal_pitch_zero = 0.0f;
 static float g_gimbal_yaw_zero = 0.0f;
-static uint8_t g_pitch_target_inited = 0;
-static uint8_t g_yaw_target_inited = 0;
+static uint8_t g_zero_locked_mask = 0;
 static TaskHandle_t g_gimbal_imu_task_handle = NULL;
-
+float Target = 60;
 /**
  * @brief   CAN断联保护动作
  * @param   无
@@ -137,6 +142,106 @@ static float Gimbal_Clamp(float value, float min_value, float max_value)
 
     return value;
 }
+
+/**
+ * @brief   清空某个电机所有已启用PID的运行状态（不改参数）
+ * @param  motor: 电机对象
+ * @retval 无
+ */
+static void Gimbal_PID_Clear_Runtime(Motor_TypeDef *motor)
+{
+    uint8_t i;
+
+    if (motor == NULL)
+    {
+        return;
+    }
+
+    for (i = 0; i < motor->PID_Use_Count && i < 2; i++)
+    {
+        motor->PID[i].integral = 0.0f;
+        motor->PID[i].error = 0.0f;
+        motor->PID[i].prev_error = 0.0f;
+        motor->PID[i].target = 0.0f;
+        motor->PID[i].prev_target = 0.0f;
+        motor->PID[i].output = 0.0f;
+    }
+}
+
+/**
+ * @brief   判断指定轴的编码器反馈是否就绪
+ * @param  axis_mask: GIMBAL_ZERO_LOCK_PITCH / GIMBAL_ZERO_LOCK_YAW / 组合
+ * @retval 1=就绪，0=未就绪
+ */
+static uint8_t Gimbal_Is_Encoder_Ready(uint8_t axis_mask)
+{
+    if (((axis_mask & GIMBAL_ZERO_LOCK_PITCH) != 0) &&
+        (Gimbal_Motor_Pitch.RxData.Encoder_Initialized == 0))
+    {
+        return 0;
+    }
+
+    if (((axis_mask & GIMBAL_ZERO_LOCK_YAW) != 0) &&
+        (Gimbal_Motor_Yaw.RxData.Encoder_Initialized == 0))
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+/**
+ * @brief   尝试按掩码锁零（可按轴选择）
+ * @param  axis_mask: GIMBAL_ZERO_LOCK_PITCH / GIMBAL_ZERO_LOCK_YAW / 组合
+ * @param  require_all_ready: 1=要求掩码内所有轴都ready才执行，0=ready哪个锁哪个
+ * @retval 无
+ */
+static void Gimbal_Try_Lock_Zero(uint8_t axis_mask, uint8_t require_all_ready)
+{
+    uint8_t valid_mask = (uint8_t)(axis_mask & GIMBAL_ZERO_LOCK_BOTH);
+
+    if (valid_mask == 0)
+    {
+        return;
+    }
+
+    if ((require_all_ready != 0) && (Gimbal_Is_Encoder_Ready(valid_mask) == 0))
+    {
+        return;
+    }
+
+    if (((valid_mask & GIMBAL_ZERO_LOCK_PITCH) != 0) &&
+        ((g_zero_locked_mask & GIMBAL_ZERO_LOCK_PITCH) == 0) &&
+        (Gimbal_Motor_Pitch.RxData.Encoder_Initialized != 0))
+    {
+        g_gimbal_pitch_zero = Gimbal_Motor_Pitch.RxData.Angle;
+        g_gimbal_pitch_target = 0.0f;
+        Gimbal_PID_Clear_Runtime(&Gimbal_Motor_Pitch);
+        g_zero_locked_mask |= GIMBAL_ZERO_LOCK_PITCH;
+    }
+
+    if (((valid_mask & GIMBAL_ZERO_LOCK_YAW) != 0) &&
+        ((g_zero_locked_mask & GIMBAL_ZERO_LOCK_YAW) == 0) &&
+        (Gimbal_Motor_Yaw.RxData.Encoder_Initialized != 0))
+    {
+        g_gimbal_yaw_zero = Gimbal_Motor_Yaw.RxData.Angle;
+        g_gimbal_yaw_target = 0.0f;
+        Gimbal_PID_Clear_Runtime(&Gimbal_Motor_Yaw);
+        g_zero_locked_mask |= GIMBAL_ZERO_LOCK_YAW;
+    }
+}
+
+/**
+ * @brief   判断指定轴是否已锁零
+ * @param  axis_mask: GIMBAL_ZERO_LOCK_PITCH / GIMBAL_ZERO_LOCK_YAW / 组合
+ * @retval 1=已全部锁零，0=未全部锁零
+ */
+static uint8_t Gimbal_Is_Zero_Locked(uint8_t axis_mask)
+{
+    uint8_t valid_mask = (uint8_t)(axis_mask & GIMBAL_ZERO_LOCK_BOTH);
+    return ((g_zero_locked_mask & valid_mask) == valid_mask) ? 1 : 0;
+}
+
 /**
  * @brief   浮点数到16位有符号整数的转换（带限幅）
  * @param  value: 输入浮点数（范围：-32768.0f ~ 32767.0f）
@@ -201,21 +306,24 @@ void Gimbal_Init(void* pramas)
 
     // 俯仰电机：角度外环 + 速度内环
     Motor_Init(&Gimbal_Motor_Pitch, 4, GM6020_Voltage, &hcan2, DJI_Control_Method_Angle);
-    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 0, 0.00f, 0.00f, 0.00f, 0.00f, -6.0f, 6.0f, -1.0f, 1.0f);
-    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 1, 0.00f, 0.00f, 0.00f, 0.00f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f, 3000.0f);
+    // PID[1]: 角度外环，输出目标速度（小限幅）
+    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 1, 0.00f, 0.00f, 0.00f, 0.00f, -2.0f, 2.0f, -0.5f, 0.5f);
+    // PID[0]: 速度内环，输出最终电机控制量（大限幅）
+    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 0, 0.00f, 0.00f, 0.00f, 0.00f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f,  3000.0f);
 
     // 偏航电机：角度外环 + 速度内环
     Motor_Init(&Gimbal_Motor_Yaw, 2, GM6020_Voltage, &hcan2, DJI_Control_Method_Angle);
-    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 0, 0.00f, 0.00f, 0.00f, 0.00f, -6.0f, 6.0f, -1.0f, 1.0f);
-    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 1, 0.00f, 0.00f, 0.00f, 0.00f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f, 3000.0f);
+    // PID[1]: 角度外环，输出目标速度（小限幅）
+    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 1, 0.00f, 0.00f, 0.00f, 0.00f, -2.0f, 2.0f, -0.5f, 0.5f);
+    // PID[0]: 速度内环，输出最终电机控制量（大限幅）
+    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 0, 0.00f, 0.00f, 0.00f, 0.00f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f,  3000.0f);
 
-    // // 清零目标和零点，等待电机首帧反馈后锁定，还在商讨怎么控制，先做保留
-    // g_gimbal_pitch_target = 0.0f;
-    // g_gimbal_yaw_target = 0.0f;
-    // g_gimbal_pitch_zero = 0.0f;
-    // g_gimbal_yaw_zero = 0.0f;
-    // g_pitch_target_inited = 0;
-    // g_yaw_target_inited = 0;
+    // 运行时参考系状态清零，后续在控制任务中按轴锁零
+    g_gimbal_pitch_target = 0.0f;
+    g_gimbal_yaw_target = 0.0f;
+    g_gimbal_pitch_zero = 0.0f;
+    g_gimbal_yaw_zero = 0.0f;
+    g_zero_locked_mask = 0;
 }
 
 // 云台电机控制任务（1kHz）
@@ -250,19 +358,20 @@ void Gimbal_Motor_Control_test(void* pramas)
         Motor_CAN_Data_Receive(&Gimbal_Motor_Pitch);
         Motor_CAN_Data_Receive(&Gimbal_Motor_Yaw);
 
-        // 首帧反馈后记录零点，后续使用相对角度闭环
-        if ((g_pitch_target_inited == 1) && (Gimbal_Motor_Pitch.RxData.Encoder_Initialized != 0))
+        // 默认两轴同步锁零；若你只想锁单轴，可改成 GIMBAL_ZERO_LOCK_PITCH / YAW
+        if (Gimbal_Is_Zero_Locked(GIMBAL_ZERO_LOCK_BOTH) == 0u)
         {
-            g_gimbal_pitch_zero = Gimbal_Motor_Pitch.RxData.Angle;
-            g_gimbal_pitch_target = 0.0f;
-            g_pitch_target_inited = 1;
+            Gimbal_Try_Lock_Zero(GIMBAL_ZERO_LOCK_BOTH, 1u);
         }
 
-        if ((g_yaw_target_inited == 0) && (Gimbal_Motor_Yaw.RxData.Encoder_Initialized != 0))
+        // 未完成锁零前，不进入闭环，保持零输出避免误动作
+        if (Gimbal_Is_Zero_Locked(GIMBAL_ZERO_LOCK_BOTH) == 0u)
         {
-            g_gimbal_yaw_zero = Gimbal_Motor_Yaw.RxData.Angle;
-            g_gimbal_yaw_target = 0.0f;
-            g_yaw_target_inited = 1;
+            can_online = CAN_Alive_IsOnline(&hcan2);
+            Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, can_output_map[can_online](0.0f));
+            Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, can_output_map[can_online](0.0f));
+            vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
+            continue;
         }
 
         //视觉给的是角度增量，本周期按增量叠加目标角
@@ -299,10 +408,10 @@ void Gimbal_Motor_Control_test(void* pramas)
 
 
 /**
- * @brief   Yaw PID测试任务（通用模板，1kHz）
+ * @brief   云台双轴PID测试任务（1kHz）
  * @param  params: 无
  * @retval 无
- * @note    该函数仅闭环Yaw轴，便于单轴PID联调
+ * @note    使用相对角反馈，便于串级PID联调
  */
 void Gimbal_Motor_Control_ALL_Test(void* params)
 {
@@ -310,29 +419,92 @@ void Gimbal_Motor_Control_ALL_Test(void* params)
     uint8_t can_online;
     float pitch_feedback;
     float pitch_output;
+    float pitch_target_speed;
     float yaw_output;
     float yaw_feedback;
+    float yaw_target_speed;
+
+    
     (void)params;
 
     time = xTaskGetTickCount();
 
+    // 测试任务启动时重置本次运行参考系
+    g_gimbal_pitch_target = 0.0f;
+    g_gimbal_yaw_target = 0.0f;
+    g_gimbal_pitch_zero = 0.0f;
+    g_gimbal_yaw_zero = 0.0f;
+    g_zero_locked_mask = 0;
+
+    pitch_feedback = 0.0f;
+    yaw_feedback = 0.0f;
+    pitch_output = 0.0f;
+    yaw_output = 0.0f;
+    uint32_t cnt = 0;
     while (1)
     {
-        // 刷新所有pitch反馈
-        Motor_CAN_Data_Receive(&Gimbal_Motor_Pitch);
-        pitch_feedback = Gimbal_Motor_Pitch.RxData.Angle;
-        // 刷新Yaw反馈
-        Motor_CAN_Data_Receive(&Gimbal_Motor_Yaw);
-        yaw_feedback = Gimbal_Motor_Yaw.RxData.Angle;
+        
 
-        // 做Pitch单轴PID
-        pitch_output = Motor_PID_Calculate(&Gimbal_Motor_Pitch, g_gimbal_pitch_target, pitch_feedback, GIMBAL_CTRL_DT);
-        pitch_output = Gimbal_Clamp(pitch_output, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT);
-        // 做Yaw单轴PID
-        yaw_output = Motor_PID_Calculate(&Gimbal_Motor_Yaw, g_gimbal_yaw_target, yaw_feedback, GIMBAL_CTRL_DT);
-        yaw_output = Gimbal_Clamp(yaw_output, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT);
-        // CAN离线保护：离线发0，在线发PID输出
+        // 1) 刷新电机反馈
+        Motor_CAN_Data_Receive(&Gimbal_Motor_Pitch);
+        Motor_CAN_Data_Receive(&Gimbal_Motor_Yaw);
+
+        // 2) 按轴一次性锁零（调PID时观察相对角更直观）
+        if (((g_zero_locked_mask & GIMBAL_ZERO_LOCK_PITCH) == 0) &&
+            (Gimbal_Motor_Pitch.RxData.Encoder_Initialized != 0))
+        {
+            g_gimbal_pitch_zero = Gimbal_Motor_Pitch.RxData.Angle;
+            g_gimbal_pitch_target = 0.0f;
+            Gimbal_Motor_Pitch.PID[0].integral = 0.0f;
+            Gimbal_Motor_Pitch.PID[1].integral = 0.0f;
+            g_zero_locked_mask |= GIMBAL_ZERO_LOCK_PITCH;
+        }
+        if (((g_zero_locked_mask & GIMBAL_ZERO_LOCK_YAW) == 0) &&
+            (Gimbal_Motor_Yaw.RxData.Encoder_Initialized != 0))
+        {
+            g_gimbal_yaw_zero = Gimbal_Motor_Yaw.RxData.Angle;
+            g_gimbal_yaw_target = 0.0f;
+            Gimbal_Motor_Yaw.PID[0].integral = 0.0f;
+            Gimbal_Motor_Yaw.PID[1].integral = 0.0f;
+            g_zero_locked_mask |= GIMBAL_ZERO_LOCK_YAW;
+        }
+
         can_online = CAN_Alive_IsOnline(&hcan2);
+
+        // 3) 未完成双轴锁零前不进闭环，避免目标/反馈参考系不一致
+        if ((g_zero_locked_mask & GIMBAL_ZERO_LOCK_BOTH) != GIMBAL_ZERO_LOCK_BOTH)
+        {
+            Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, Gimbal_Output_To_CAN_Zero(0.0f));
+            Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, Gimbal_Output_To_CAN_Zero(0.0f));
+            vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
+            continue;
+        }
+        //累加
+        cnt++;
+        //产生方波信号
+        if(cnt / 5000)
+        {
+            Target = -Target;
+            g_gimbal_yaw_target = Target;
+            cnt = 0;
+        }
+        Gimbal_Motor_Pitch.RxData.Angle = (Gimbal_Motor_Pitch.RxData.Angle - g_gimbal_pitch_zero);
+        pitch_feedback = Gimbal_Motor_Pitch.RxData.Angle;
+        Gimbal_Motor_Yaw.RxData.Angle = (Gimbal_Motor_Yaw.RxData.Angle - g_gimbal_yaw_zero);
+        yaw_feedback = Gimbal_Motor_Yaw.RxData.Angle;
+        
+
+        // 6) 串级PID计算（测试模式：显式调用外环和内环）
+        pitch_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Pitch, g_gimbal_pitch_target, pitch_feedback, GIMBAL_CTRL_DT);
+        pitch_output = Motor_PID_Calculate_Speed(&Gimbal_Motor_Pitch, pitch_target_speed, Gimbal_Motor_Pitch.RxData.Speed, GIMBAL_CTRL_DT);
+        
+        yaw_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Yaw, g_gimbal_yaw_target, yaw_feedback, GIMBAL_CTRL_DT);
+        yaw_output = Motor_PID_Calculate_Speed(&Gimbal_Motor_Yaw, yaw_target_speed, Gimbal_Motor_Yaw.RxData.Speed, GIMBAL_CTRL_DT);
+        
+        //输出限幅
+        pitch_output = Gimbal_Clamp(pitch_output, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT);
+        yaw_output = Gimbal_Clamp(yaw_output, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT);
+
         if (can_online != 0)
         {
             Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, Gimbal_Output_To_CAN_Normal(pitch_output));
