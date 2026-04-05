@@ -1,4 +1,5 @@
 #include "dvc_manifold.h"
+#include "stm32f405xx.h"
 #include <string.h>
 
 Manifold_UART_Rx_Data Rx_Data;
@@ -21,6 +22,7 @@ void Manifold_USB_Rx_Callback(uint8_t *Buf, uint32_t Len)
     if ((Buf[0] == Rx_Data.Frame_Header) && (Buf[Len - 1] == Rx_Data.Frame_Tail))
     {
         // 第二阶段再补充完整协议解析
+        memcpy(&Rx_Data.Taget_Angle, Buf + 1, sizeof(Rx_Data.Taget_Angle));
     }
 }
 

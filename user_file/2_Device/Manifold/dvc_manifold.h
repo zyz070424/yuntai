@@ -1,7 +1,7 @@
 #ifndef __DVC_MANIFOLD_H__
 #define __DVC_MANIFOLD_H__
 
-#include "drv_USB.h"
+#include "drv_usb.h"
 #include "alg_quaternion.h"
 /**
  * @brief 视觉Manifold状态
@@ -58,11 +58,8 @@ typedef struct
 {
     uint8_t Frame_Header;//帧头
     uint8_t Frame_Tail;//帧尾    
-    uint8_t Shoot_Flag; //是否射击
-    float Gimbal_Pitch_Angle_Increment;//云台俯仰角度增量
-    float Gimbal_Yaw_Angle_Increment;//云台偏航角度增量
-    float Gimbal_Pitch_Omega_FeedForward;//云台俯仰角速度前馈
-    float Gimbal_Yaw_Omega_FeedForward;//云台偏航角速度前馈
+    euler_t Taget_Angle; //目标欧拉角
+    uint8_t Shoot_Flag; //
     enum Enum_Manifold_Enemy_ID Enemy_ID;//敌方机器人ID
     uint16_t Confidence_Level;//置信度
 }Manifold_UART_Rx_Data;

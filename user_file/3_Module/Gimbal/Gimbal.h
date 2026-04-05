@@ -9,14 +9,12 @@
 #include "FreeRTOS.h"
 #include "alg_quaternion.h"
 #include "main.h"
-#include "dvc_motor.h"
 #include "spi.h"
 #include "can.h"
 #include <stdint.h>
 #include <string.h>
 void Gimbal_Init(void* pramas);
 void Gimbal_Euler(void *pramas);
-void Gimbal_Motor_Control_test(void* pramas);
 void Gimbal_Motor_Control_ALL_Test(void* pramas);
 void Gimbal_Task(void* pramas);
 void Gimbal_Manifold_Control(void *pramas);
