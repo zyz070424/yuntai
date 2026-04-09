@@ -48,6 +48,13 @@ void PID_Init(PID_TypeDef *pid)
     pid->deadband_enable = false;
     pid->deadband = 0.0f;
 
+    pid->output_filter_enable = false;
+    pid->output_filter_tau_s = 0.0f;
+    pid->output_slew_enable = false;
+    pid->output_slew_rate = 0.0f;
+    pid->output_shaper_inited = false;
+    pid->output_shaper_state = 0.0f;
+
     pid->dt = 0.0f;
 }
 /**
@@ -116,6 +123,56 @@ void PID_Deadband_Enable(PID_TypeDef *pid, bool enable, float deadband)
     pid->deadband_enable = enable;
     pid->deadband = deadband;
 }
+
+/**
+ * @brief 使能/禁用PID输出低通整形
+ * @param pid: PID 控制器指针
+ * @param enable: 是否使能
+ * @param tau_s: 低通时间常数（秒）
+ */
+void PID_Output_Filter_Enable(PID_TypeDef *pid, bool enable, float tau_s)
+{
+    if (pid == NULL)
+    {
+        return;
+    }
+
+    pid->output_filter_enable = enable;
+    pid->output_filter_tau_s = (tau_s > 0.0f) ? tau_s : 0.0f;
+}
+
+/**
+ * @brief 使能/禁用PID输出斜率限制
+ * @param pid: PID 控制器指针
+ * @param enable: 是否使能
+ * @param slew_rate: 最大变化率（单位/秒）
+ */
+void PID_Output_Slew_Enable(PID_TypeDef *pid, bool enable, float slew_rate)
+{
+    if (pid == NULL)
+    {
+        return;
+    }
+
+    pid->output_slew_enable = enable;
+    pid->output_slew_rate = fabsf(slew_rate);
+}
+
+/**
+ * @brief 重置PID输出整形内部状态
+ * @param pid: PID 控制器指针
+ * @param init_output: 重置后的初始输出值
+ */
+void PID_Output_Shaper_Reset(PID_TypeDef *pid, float init_output)
+{
+    if (pid == NULL)
+    {
+        return;
+    }
+
+    pid->output_shaper_state = init_output;
+    pid->output_shaper_inited = true;
+}
 /**
  * @brief 设置 PID 控制器参数
  * @param pid: PID 控制器指针
@@ -157,6 +214,14 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
 {
     const float dt_min = 1e-6f;
     float integral_coef = 1.0f;
+    float integral_candidate;
+    float output_unsat_candidate;
+    float output_unsat;
+    float output_limited;
+    float output_shaped;
+    float alpha;
+    float delta;
+    float delta_max;
     // 检查 PID 控制器指针是否为空
     if (pid == NULL)
     {
@@ -193,6 +258,8 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
         pid->I_out = 0.0f;
         pid->D_out = 0.0f;
         pid->FeedForward_out = 0.0f;
+        pid->output_shaper_state = 0.0f;
+        pid->output_shaper_inited = true;
         pid->prev_error = pid->error;
         pid->prev_target = pid->target;
         return 0.0f;
@@ -220,19 +287,6 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
             integral_coef = (A - abs_err) / (A - B);
         }
     }
-    // 计算积分项输出
-    pid->integral += pid->error * pid->dt * integral_coef;
-    // 检查积分项是否超出限幅范围，若超出则进行限幅
-    if (pid->integral < pid->integral_min)
-    {
-        pid->integral = pid->integral_min;
-    }
-    else if (pid->integral > pid->integral_max)
-    {
-        pid->integral = pid->integral_max;
-    }
-    // 计算积分项输出
-    pid->I_out = pid->Ki * pid->integral;
     // 检查是否使用微分先行
     if (pid->differential_enable)
     {
@@ -244,17 +298,104 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
     }
     // 计算前馈项输出
     pid->FeedForward_out = pid->FeedForward * pid->target;
-    // 计算输出值
-    pid->output = pid->P_out + pid->I_out + pid->D_out + pid->FeedForward_out;
+
+    // 先计算“候选积分”，再做抗饱和判定，避免积分在饱和边缘持续累加
+    integral_candidate = pid->integral + pid->error * pid->dt * integral_coef;
+    if (integral_candidate < pid->integral_min)
+    {
+        integral_candidate = pid->integral_min;
+    }
+    else if (integral_candidate > pid->integral_max)
+    {
+        integral_candidate = pid->integral_max;
+    }
+
+    output_unsat_candidate = pid->P_out + pid->Ki * integral_candidate + pid->D_out + pid->FeedForward_out;
+    if (((output_unsat_candidate > pid->out_max) && (pid->error > 0.0f)) ||
+        ((output_unsat_candidate < pid->out_min) && (pid->error < 0.0f)))
+    {
+        // 饱和且误差继续推动同方向饱和时，冻结积分
+    }
+    else
+    {
+        pid->integral = integral_candidate;
+    }
+
+    pid->I_out = pid->Ki * pid->integral;
+    // 计算未限幅输出
+    output_unsat = pid->P_out + pid->I_out + pid->D_out + pid->FeedForward_out;
+    output_limited = output_unsat;
+
     // 检查输出是否超出限幅范围，若超出则进行限幅
-    if (pid->output < pid->out_min)
+    if (output_limited < pid->out_min)
     {
-        pid->output = pid->out_min;
+        output_limited = pid->out_min;
     }
-    else if (pid->output > pid->out_max)
+    else if (output_limited > pid->out_max)
     {
-        pid->output = pid->out_max;
+        output_limited = pid->out_max;
     }
+
+    // 输出整形：可选低通 + 可选斜率限制
+    if (pid->output_filter_enable || pid->output_slew_enable)
+    {
+        if (pid->output_shaper_inited == false)
+        {
+            pid->output_shaper_state = output_limited;
+            pid->output_shaper_inited = true;
+        }
+
+        output_shaped = output_limited;
+        if (pid->output_filter_enable && (pid->output_filter_tau_s > 0.0f))
+        {
+            alpha = pid->dt / (pid->output_filter_tau_s + pid->dt);
+            if (alpha < 0.0f)
+            {
+                alpha = 0.0f;
+            }
+            else if (alpha > 1.0f)
+            {
+                alpha = 1.0f;
+            }
+
+            output_shaped = pid->output_shaper_state + alpha * (output_limited - pid->output_shaper_state);
+        }
+
+        if (pid->output_slew_enable && (pid->output_slew_rate > 0.0f))
+        {
+            delta = output_shaped - pid->output_shaper_state;
+            delta_max = pid->output_slew_rate * pid->dt;
+            if (delta > delta_max)
+            {
+                delta = delta_max;
+            }
+            else if (delta < -delta_max)
+            {
+                delta = -delta_max;
+            }
+
+            output_shaped = pid->output_shaper_state + delta;
+        }
+
+        if (output_shaped < pid->out_min)
+        {
+            output_shaped = pid->out_min;
+        }
+        else if (output_shaped > pid->out_max)
+        {
+            output_shaped = pid->out_max;
+        }
+
+        pid->output = output_shaped;
+        pid->output_shaper_state = output_shaped;
+    }
+    else
+    {
+        pid->output = output_limited;
+        pid->output_shaper_state = pid->output;
+        pid->output_shaper_inited = true;
+    }
+
     // 更新前一个误差和目标值
     pid->prev_error = pid->error;
     pid->prev_target = pid->target;

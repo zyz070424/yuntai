@@ -22,7 +22,7 @@ typedef struct {
 
 // IMU数据结构
 typedef struct {
-    vec3_t gyro;     // 陀螺仪 (rad/s)
+    vec3_t gyro;     // 陀螺仪 (deg/s)
     vec3_t acc;      // 加速度计 (g)
     float temp;      // 温度 (℃)
     float dt;        // 采样时间 (s)

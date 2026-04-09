@@ -54,7 +54,15 @@ typedef struct {
     bool deadband_enable; // 死区使能
     float deadband; // 死区临界值值
 
-    // ===== 10. 时间间隔 =====
+    // ===== 10. 输出整形（可选）=====
+    bool output_filter_enable; // 输出低通使能
+    float output_filter_tau_s; // 输出低通时间常数（秒）
+    bool output_slew_enable;   // 输出斜率限制使能
+    float output_slew_rate;    // 输出最大变化率（单位/秒）
+    bool output_shaper_inited; // 输出整形状态是否已初始化
+    float output_shaper_state; // 输出整形内部状态
+
+    // ===== 11. 时间间隔 =====
     float dt; // 时间间隔（单位：秒）
 } PID_TypeDef;
 void PID_Init(PID_TypeDef *pid);
@@ -62,6 +70,12 @@ void PID_Init(PID_TypeDef *pid);
 void PID_Differential_Enable(PID_TypeDef *pid,bool enable);
 
 void PID_Deadband_Enable(PID_TypeDef *pid,bool enable,float deadband);
+
+void PID_Output_Filter_Enable(PID_TypeDef *pid, bool enable, float tau_s);
+
+void PID_Output_Slew_Enable(PID_TypeDef *pid, bool enable, float slew_rate);
+
+void PID_Output_Shaper_Reset(PID_TypeDef *pid, float init_output);
 
 void PID_Integral_Separation_Enable(PID_TypeDef *pid,bool enable,float threshold_A,float threshold_B);
 

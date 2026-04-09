@@ -1,10 +1,13 @@
 ﻿#include "Gimbal.h"
+#include "alg_pid.h"
+#include "drv_usb.h"
 #include "dvc_motor.h"
 #include "alg_dwt.h"
 #include "portmacro.h"
+#include "stm32f4xx_hal.h"
 #include <stdint.h>
 #include <math.h>
-
+#define PI   3.1415926f
 #define GIMBAL_CTRL_PERIOD_TICK     1
 #define GIMBAL_CTRL_DT              0.001f
 #define GIMBAL_MAHONY_KP            0.5f
@@ -16,7 +19,7 @@
 #define GIMBAL_IMU_DT_MAX_S         0.0100f
 
 // IMU 数据就绪中断开关：0=纯任务轮询，1=中断唤醒任务（中断里不读SPI）
-#define GIMBAL_IMU_DRDY_ENABLE      1
+#define GIMBAL_IMU_DRDY_ENABLE      0
 // 中断模式下任务等待超时（tick），超时后回退一次轮询读取
 #define GIMBAL_IMU_WAIT_TIMEOUT_TICK 2
 
@@ -27,11 +30,47 @@
 #define GIMBAL_YAW_MAX_ANGLE       (120.0f)
 
 // 电机输出限幅（GM6020电压模式常用范围）
-#define GIMBAL_MOTOR_CMD_LIMIT      3000.0f
+#define GIMBAL_MOTOR_CMD_LIMIT      10000.0f
 
-// 单次视觉增量限幅，防止异常包导致目标突变
-#define GIMBAL_VISION_INC_LIMIT     2.0f
+// Yaw测试信号与串级整形参数
+#define GIMBAL_YAW_TEST_FREQ_HZ              0.30f
+#define GIMBAL_YAW_TEST_AMP_DEG              35.0f
+#define GIMBAL_YAW_TARGET_SPEED_TAU_S        0.030f
+#define GIMBAL_YAW_TARGET_SPEED_SLEW_RAD_S2  8.0f
 
+// Yaw外环参数（角度环 -> 速度目标）
+#define GIMBAL_YAW_ANGLE_KP                  0.12f
+#define GIMBAL_YAW_ANGLE_KI                  0.1f
+#define GIMBAL_YAW_ANGLE_KD                  0.00f
+#define GIMBAL_YAW_ANGLE_OUT_LIMIT           4.0f
+#define GIMBAL_YAW_ANGLE_I_LIMIT             1.5f
+#define GIMBAL_YAW_ANGLE_DEADBAND_DEG        0.4f
+
+// Yaw内环参数（速度环 -> 电机控制量）
+#define GIMBAL_YAW_SPEED_KP                  2500.0f
+#define GIMBAL_YAW_SPEED_KI                  700.0f
+#define GIMBAL_YAW_SPEED_KD                  0.00f
+#define GIMBAL_YAW_SPEED_I_LIMIT             2000.0f
+
+// Pitch测试信号与串级整形参数（与Yaw同结构）
+#define GIMBAL_PITCH_TEST_FREQ_HZ              0.60f
+#define GIMBAL_PITCH_TEST_AMP_DEG              40.0f
+#define GIMBAL_PITCH_TARGET_SPEED_TAU_S        0.020f
+#define GIMBAL_PITCH_TARGET_SPEED_SLEW_RAD_S2  12.0f
+
+// Pitch外环参数（角度环 -> 速度目标）
+#define GIMBAL_PITCH_ANGLE_KP                  0.14f
+#define GIMBAL_PITCH_ANGLE_KI                  0.1f
+#define GIMBAL_PITCH_ANGLE_KD                  0.00f
+#define GIMBAL_PITCH_ANGLE_OUT_LIMIT           4.5f
+#define GIMBAL_PITCH_ANGLE_I_LIMIT             1.5f
+#define GIMBAL_PITCH_ANGLE_DEADBAND_DEG        0.4f
+
+// Pitch内环参数（速度环 -> 电机控制量）
+#define GIMBAL_PITCH_SPEED_KP                  1100.0f
+#define GIMBAL_PITCH_SPEED_KI                  280.0f
+#define GIMBAL_PITCH_SPEED_KD                  0.00f
+#define GIMBAL_PITCH_SPEED_I_LIMIT             2000.0f
 // 运行时锁零掩码：支持按轴选择
 #define GIMBAL_ZERO_LOCK_PITCH      (1 << 0)
 #define GIMBAL_ZERO_LOCK_YAW        (1 << 1)
@@ -49,7 +88,9 @@ static float g_gimbal_yaw_target = 0.0f;
 static float g_gimbal_pitch_zero = 0.0f;
 static float g_gimbal_yaw_zero = 0.0f;
 static uint8_t g_zero_locked_mask = 0;
+#if GIMBAL_IMU_DRDY_ENABLE
 static TaskHandle_t g_gimbal_imu_task_handle = NULL;
+#endif
 static alg_dwt_timebase_t g_gimbal_imu_timebase;
 volatile float g_gimbal_imu_last_dt_s = GIMBAL_IMU_DT_DEFAULT_S;
 volatile uint8_t g_gimbal_imu_last_dt_from_dwt = 0;
@@ -59,7 +100,53 @@ static float g_gimbal_yaw_last_rel_wrapped_deg = 0.0f;
 static float g_gimbal_yaw_continuous_deg = 0.0f;
 volatile float g_gimbal_yaw_raw_deg = 0.0f;
 volatile float g_gimbal_yaw_send_deg = 0.0f;
-float Target = 60;
+float Target_Yaw = GIMBAL_YAW_TEST_AMP_DEG;
+// 测试用：单轴正弦目标
+float Target_Pitch = GIMBAL_PITCH_TEST_AMP_DEG;
+static float g_gimbal_yaw_test_phase = 0.0f;
+static float g_gimbal_pitch_test_phase = 0.0f;
+
+/**
+ * @brief   生成幅值周期翻转的阶跃信号
+ * @param   elapsed_ms: 当前已运行时间（毫秒）
+ * @param   flip_interval_ms: 每次翻转间隔（毫秒）
+ * @param   amplitude: 阶跃幅值，输出将在 +amplitude 和 -amplitude 之间切换
+ * @retval  当前时刻对应的翻转阶跃信号值
+ * @note    使用示例：
+ *          target = Gimbal_Generate_Flip_Step_Signal(gyro_test_time_ms, 1000u, 20.0f);
+ *          这表示每 1000ms 翻转一次，在 +20 和 -20 之间切换。
+ */
+static float Gimbal_Generate_Flip_Step_Signal(uint32_t elapsed_ms,
+                                              uint32_t flip_interval_ms,
+                                              float amplitude)
+{
+    float amplitude_abs;
+    uint32_t flip_count;
+
+    if (isfinite(amplitude) == 0)
+    {
+        return 0.0f;
+    }
+
+    if (flip_interval_ms == 0u)
+    {
+        return 0.0f;
+    }
+
+    amplitude_abs = fabsf(amplitude);
+    if (amplitude_abs <= 0.0f)
+    {
+        return 0.0f;
+    }
+
+    flip_count = elapsed_ms / flip_interval_ms;
+    if ((flip_count & 1u) == 0u)
+    {
+        return amplitude_abs;
+    }
+
+    return -amplitude_abs;
+}
 
 /**
  * @brief   将角度限制到 [-180, 180) 区间
@@ -159,6 +246,7 @@ static void Gimbal_CAN_Offline_Protect(void)
 
     g_gimbal_pitch_target = 0.0f;
     g_gimbal_yaw_target = 0.0f;
+   
 }
 
 /**
@@ -204,11 +292,11 @@ static void Gimbal_SPI_Online_Protect(void)
  */
 static void Gimbal_USB_Offline_Protect(void)
 {
-    Rx_Data.Shoot_Flag = 0;
-    Rx_Data.Taget_Angle.pitch = 0.0f;
-    Rx_Data.Taget_Angle.yaw = 0.0f;
-    Rx_Data.Enemy_ID = Manifold_Enemy_ID_NONE_0;
-    Rx_Data.Confidence_Level = 0;
+    //Rx_Data.Shoot_Flag = 0;
+    Rx_Data.Taget_Pitch = 0.0f;
+    Rx_Data.Taget_Yaw = 0.0f;
+    //Rx_Data.Enemy_ID = Manifold_Enemy_ID_NONE_0;
+    //Rx_Data.Confidence_Level = 0;
 }
 
 /**
@@ -265,6 +353,8 @@ static void Gimbal_PID_Clear_Runtime(Motor_TypeDef *motor)
         motor->PID[i].target = 0.0f;
         motor->PID[i].prev_target = 0.0f;
         motor->PID[i].output = 0.0f;
+        motor->PID[i].output_shaper_state = 0.0f;
+        motor->PID[i].output_shaper_inited = true;
     }
 }
 
@@ -403,21 +493,42 @@ void Gimbal_Init(void* pramas)
     {
         return;
     }
-
+    
     // 俯仰电机：角度外环 + 速度内环
     Motor_Init(&Gimbal_Motor_Pitch, 4, GM6020_Voltage, &hcan2, DJI_Control_Method_Angle);
     // PID[1]: 角度外环，输出目标速度（小限幅）
-    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 1, 0.00f, 0.00f, 0.00f, 0.00f, -2.0f, 2.0f, -0.5f, 0.5f);
+    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 1,
+                         GIMBAL_PITCH_ANGLE_KP, GIMBAL_PITCH_ANGLE_KI, GIMBAL_PITCH_ANGLE_KD, 0.00f,
+                         -GIMBAL_PITCH_ANGLE_OUT_LIMIT, GIMBAL_PITCH_ANGLE_OUT_LIMIT,
+                         -GIMBAL_PITCH_ANGLE_I_LIMIT, GIMBAL_PITCH_ANGLE_I_LIMIT);
     // PID[0]: 速度内环，输出最终电机控制量（大限幅）
-    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 0, 0.00f, 0.00f, 0.00f, 0.00f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f,  3000.0f);
+    Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 0,
+                         GIMBAL_PITCH_SPEED_KP, GIMBAL_PITCH_SPEED_KI, GIMBAL_PITCH_SPEED_KD, 0.00f,
+                         -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT,
+                         -GIMBAL_PITCH_SPEED_I_LIMIT, GIMBAL_PITCH_SPEED_I_LIMIT);
+    // 角度外环输出整形（放在PID层）：低通 + 斜率限制
+    PID_Output_Filter_Enable(&Gimbal_Motor_Pitch.PID[1], true, GIMBAL_PITCH_TARGET_SPEED_TAU_S);
+    PID_Output_Slew_Enable(&Gimbal_Motor_Pitch.PID[1], true, GIMBAL_PITCH_TARGET_SPEED_SLEW_RAD_S2);
+    // 启用死区，避免小信号时电机抖动
+    //PID_Deadband_Enable(&Gimbal_Motor_Pitch.PID[1], 1, GIMBAL_PITCH_ANGLE_DEADBAND_DEG);
 
     // 偏航电机：角度外环 + 速度内环
     Motor_Init(&Gimbal_Motor_Yaw, 2, GM6020_Voltage, &hcan2, DJI_Control_Method_Angle);
     // PID[1]: 角度外环，输出目标速度（小限幅）
-    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 1, 1000.0f, 100.0f, 0.00f, 0.00f, -2.0f, 2.0f, -0.5f, 0.5f);
+    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 1,
+                         GIMBAL_YAW_ANGLE_KP, GIMBAL_YAW_ANGLE_KI, GIMBAL_YAW_ANGLE_KD, 0.00f,
+                         -GIMBAL_YAW_ANGLE_OUT_LIMIT, GIMBAL_YAW_ANGLE_OUT_LIMIT,
+                         -GIMBAL_YAW_ANGLE_I_LIMIT, GIMBAL_YAW_ANGLE_I_LIMIT);
     // PID[0]: 速度内环，输出最终电机控制量（大限幅）
-    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 0, 2500.0f, 1000.0f, 0.00f, 0.00f, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT, -3000.0f,  3000.0f);
-
+    Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 0,
+                         GIMBAL_YAW_SPEED_KP, GIMBAL_YAW_SPEED_KI, GIMBAL_YAW_SPEED_KD, 0.00f,
+                         -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT,
+                         -GIMBAL_YAW_SPEED_I_LIMIT, GIMBAL_YAW_SPEED_I_LIMIT);
+    // 角度外环输出整形（放在PID层）：低通 + 斜率限制
+    //PID_Output_Filter_Enable(&Gimbal_Motor_Yaw.PID[1], true, GIMBAL_YAW_TARGET_SPEED_TAU_S);
+    //PID_Output_Slew_Enable(&Gimbal_Motor_Yaw.PID[1], true, GIMBAL_YAW_TARGET_SPEED_SLEW_RAD_S2);
+    // 启用死区，避免小信号时电机抖动
+   
     // 运行时参考系状态清零，后续在控制任务中按轴锁零
     g_gimbal_pitch_target = 0.0f;
     g_gimbal_yaw_target = 0.0f;
@@ -438,13 +549,11 @@ void Gimbal_Motor_Control_ALL_Test(void* params)
 {
     TickType_t time;
     uint8_t can_online;
-    float pitch_feedback;
     float pitch_output;
-    float pitch_target_speed;
+    float pitch_target_speed = 1.5;
     float yaw_output;
-    float yaw_feedback;
     float yaw_target_speed;
-
+    static uint32_t cnt;
     static int16_t (* const can_output_map[2])(float) =
     {
         Gimbal_Output_To_CAN_Zero,
@@ -463,11 +572,8 @@ void Gimbal_Motor_Control_ALL_Test(void* params)
     g_gimbal_yaw_zero = 0.0f;
     g_zero_locked_mask = 0;
 
-    pitch_feedback = 0.0f;
-    yaw_feedback = 0.0f;
     pitch_output = 0.0f;
     yaw_output = 0.0f;
-    uint32_t cnt = 0;
     while (1)
     {
         
@@ -476,14 +582,14 @@ void Gimbal_Motor_Control_ALL_Test(void* params)
         Motor_CAN_Data_Receive(&Gimbal_Motor_Pitch);
         Motor_CAN_Data_Receive(&Gimbal_Motor_Yaw);
 
-       // 默认两轴同步锁零；若你只想锁单轴，可改成 GIMBAL_ZERO_LOCK_PITCH / YAW
-        if (Gimbal_Is_Zero_Locked(GIMBAL_ZERO_LOCK_BOTH) == 0u)
+       // Pitch使用IMU世界坐标，不做锁零门控；仅Yaw需要锁零
+        if (Gimbal_Is_Zero_Locked(GIMBAL_ZERO_LOCK_YAW) == 0u)
         {
-            Gimbal_Try_Lock_Zero(GIMBAL_ZERO_LOCK_BOTH, 1u);
+            Gimbal_Try_Lock_Zero(GIMBAL_ZERO_LOCK_YAW, 1u);
         }
 
-        // 未完成锁零前，不进入闭环，保持零输出避免误动作
-        if (Gimbal_Is_Zero_Locked(GIMBAL_ZERO_LOCK_BOTH) == 0u)
+        // 未完成Yaw锁零前，不进入闭环，保持零输出避免误动作
+        if (Gimbal_Is_Zero_Locked(GIMBAL_ZERO_LOCK_YAW) == 0u)
         {
             can_online = CAN_Alive_IsOnline(&hcan2);
             Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, can_output_map[can_online](0.0f));
@@ -491,25 +597,35 @@ void Gimbal_Motor_Control_ALL_Test(void* params)
             vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
             continue;
         }
-
-        //累加
-        cnt++;
-        //产生方波信号
-        if(cnt / 5000)
+        
+       // 相位累加构造连续正弦目标，避免计数器抖动/溢出导致相位跳变
+        g_gimbal_yaw_test_phase += 2.0f * PI * GIMBAL_YAW_TEST_FREQ_HZ * GIMBAL_CTRL_DT;
+        if (g_gimbal_yaw_test_phase >= 2.0f * PI)
         {
-            Target = -Target;
-            g_gimbal_yaw_target = Target;
-            cnt = 0;
+            g_gimbal_yaw_test_phase -= 2.0f * PI;
+        }
+
+        g_gimbal_pitch_test_phase += 2.0f * PI * GIMBAL_PITCH_TEST_FREQ_HZ * GIMBAL_CTRL_DT;
+        if (g_gimbal_pitch_test_phase >= 2.0f * PI)
+        {
+            g_gimbal_pitch_test_phase -= 2.0f * PI;
         }
         
-       pitch_feedback = Gimbal_Motor_Pitch.RxData.Angle - g_gimbal_pitch_zero;
-       yaw_feedback = Gimbal_Motor_Yaw.RxData.Angle - g_gimbal_yaw_zero;
+       
+        g_gimbal_yaw_target = Target_Yaw * sinf(g_gimbal_yaw_test_phase);
 
+        g_gimbal_pitch_target = Target_Pitch * sinf(g_gimbal_pitch_test_phase);
+        //pitch_target_speed = Gimbal_Generate_Flip_Step_Signal(time,1000,1.5);
         // 6) 串级PID计算（测试模式：显式调用外环和内环）
-        pitch_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Pitch, g_gimbal_pitch_target, pitch_feedback, GIMBAL_CTRL_DT);
+        pitch_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Pitch, g_gimbal_pitch_target, -Gimbal_Euler_Angle_to_send.pitch, GIMBAL_CTRL_DT);
+        // cnt ++;
+        // if(cnt %1000 == 0)
+        // {
+        //     pitch_target_speed = -pitch_target_speed;
+        // }
         pitch_output = Motor_PID_Calculate_Speed(&Gimbal_Motor_Pitch, pitch_target_speed, Gimbal_Motor_Pitch.RxData.Speed, GIMBAL_CTRL_DT);
         
-        yaw_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Yaw, g_gimbal_yaw_target, yaw_feedback, GIMBAL_CTRL_DT);
+        yaw_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Yaw, g_gimbal_yaw_target, Gimbal_Euler_Angle_to_send.yaw, GIMBAL_CTRL_DT);
         yaw_output = Motor_PID_Calculate_Speed(&Gimbal_Motor_Yaw, yaw_target_speed, Gimbal_Motor_Yaw.RxData.Speed, GIMBAL_CTRL_DT);
         
         //输出限幅
@@ -613,6 +729,7 @@ void Gimbal_Manifold_Control(void *pramas)
     while (1)
     {
         // 周期发送当前欧拉角到视觉
+        //USB_SendString("Gimbal Euler Angles: ");
         Manifold_USB_SendData(&Tx_Data, Gimbal_Euler_Angle_to_send);
         vTaskDelayUntil(&time, 10);
     }

@@ -50,13 +50,23 @@ static void USB_Exit_Critical(uint32_t primask)
 }
 
 /**
- * @brief   USB通信存活喂狗
+ * @brief   USB-RX通信存活喂狗
  * @param   无
  * @retval  无
  */
-static void USB_Alive_Feed(void)
+static void USB_Alive_Rx_Feed(void)
 {
     USB_Manage_Object.Alive_Flag++;
+}
+
+/**
+ * @brief   USB-TX通信存活喂狗
+ * @param   无
+ * @retval  无
+ */
+static void USB_Alive_Tx_Feed(void)
+{
+    USB_Manage_Object.Tx_Alive_Flag++;
 }
 
 /**
@@ -144,6 +154,10 @@ void USB_Init(USB_Callback callback)
 
     USB_Manage_Object.Alive_Flag = 0;
     USB_Manage_Object.Alive_Pre_Flag = 0;
+    USB_Manage_Object.Tx_Alive_Flag = 0;
+    USB_Manage_Object.Tx_Alive_Pre_Flag = 0;
+    USB_Manage_Object.Alive_Rx_Online = 0;
+    USB_Manage_Object.Alive_Tx_Online = 0;
     USB_Manage_Object.Alive_Online = 0;
     USB_Manage_Object.Alive_Changed = 0;
 
@@ -258,7 +272,7 @@ void USB_Rx_Callback(uint8_t *buf, uint32_t len)
     if (len > 0)
     {
         USB_Swap_Rx_Buffer();
-        USB_Alive_Feed();
+        USB_Alive_Rx_Feed();
 
         // 先重装下一包接收，缩短NAK窗口，避免上层处理耗时影响USB时序
         USB_Start_Receive();
@@ -282,19 +296,29 @@ void USB_Rx_Callback(uint8_t *buf, uint32_t len)
 void USB_TxCplt_Callback(void)
 {
     USB_Manage_Object.Tx_Busy = 0;
+    USB_Alive_Tx_Feed();
 }
 
 /**
- * @brief   100ms周期检查USB链路是否在线（Flag/Pre_Flag机制）
+ * @brief   100ms周期检查USB链路是否在线（RX/TX分向统计）
  * @param   无
  * @retval  无
  */
 void USB_Alive_Check_100ms(void)
 {
+    uint8_t rx_online_new;
+    uint8_t tx_online_new;
     uint8_t online_new;
 
-    online_new = (uint8_t)(USB_Manage_Object.Alive_Flag != USB_Manage_Object.Alive_Pre_Flag);
+    rx_online_new = (uint8_t)(USB_Manage_Object.Alive_Flag != USB_Manage_Object.Alive_Pre_Flag);
     USB_Manage_Object.Alive_Pre_Flag = USB_Manage_Object.Alive_Flag;
+    tx_online_new = (uint8_t)(USB_Manage_Object.Tx_Alive_Flag != USB_Manage_Object.Tx_Alive_Pre_Flag);
+    USB_Manage_Object.Tx_Alive_Pre_Flag = USB_Manage_Object.Tx_Alive_Flag;
+
+    USB_Manage_Object.Alive_Rx_Online = rx_online_new;
+    USB_Manage_Object.Alive_Tx_Online = tx_online_new;
+    // 链路在线判定：RX在线 或 TX在线
+    online_new = (uint8_t)((rx_online_new != 0u) || (tx_online_new != 0u));
 
     if (online_new != USB_Manage_Object.Alive_Online)
     {
@@ -311,6 +335,26 @@ void USB_Alive_Check_100ms(void)
 uint8_t USB_Alive_IsOnline(void)
 {
     return USB_Manage_Object.Alive_Online;
+}
+
+/**
+ * @brief   获取当前USB-RX在线状态
+ * @param   无
+ * @retval  0=离线 1=在线
+ */
+uint8_t USB_Alive_IsRxOnline(void)
+{
+    return USB_Manage_Object.Alive_Rx_Online;
+}
+
+/**
+ * @brief   获取当前USB-TX在线状态
+ * @param   无
+ * @retval  0=离线 1=在线
+ */
+uint8_t USB_Alive_IsTxOnline(void)
+{
+    return USB_Manage_Object.Alive_Tx_Online;
 }
 
 /**

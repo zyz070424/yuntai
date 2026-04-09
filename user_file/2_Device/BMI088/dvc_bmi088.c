@@ -3,7 +3,33 @@
 #include "task.h"
 
 #define BMI088_OK_OR_RETURN(x) do { if ((x) != HAL_OK) return HAL_ERROR; } while (0)
+static quat_t g_bmi088_quat = {1.0f, 0.0f, 0.0f, 0.0f};
 
+/**
+ * @brief 传感器坐标系 -> 云台机体系固定映射
+ * @note  当前安装姿态等效于绕 +Z 旋转 90°：Xb = Ys, Yb = -Xs, Zb = Zs
+ *        对 gyro/acc 统一做同一映射，避免仅在欧拉层“硬对调”带来的轴耦合。
+ */
+static void BMI088_MapSensorToBody(imu_data_t *imu)
+{
+    float sx;
+    float sy;
+
+    if (imu == NULL)
+    {
+        return;
+    }
+
+    sx = imu->gyro.x;
+    sy = imu->gyro.y;
+    imu->gyro.x = sy;
+    imu->gyro.y = -sx;
+
+    sx = imu->acc.x;
+    sy = imu->acc.y;
+    imu->acc.x = sy;
+    imu->acc.y = -sx;
+}
 /**
  * @brief 初始化BMI088传感器
  * @param hspi SPI句柄
@@ -19,6 +45,11 @@ HAL_StatusTypeDef BMI088_Init(SPI_HandleTypeDef *hspi)
     {
         return HAL_ERROR;
     }
+
+    g_bmi088_quat.w = 1.0f;
+    g_bmi088_quat.x = 0.0f;
+    g_bmi088_quat.y = 0.0f;
+    g_bmi088_quat.z = 0.0f;
 
     SPI_DMA_Init();
 
@@ -115,7 +146,7 @@ void BMI088_ReadGyro(SPI_HandleTypeDef *hspi, imu_data_t *data)
     gyro_data[1] = (int16_t)((uint16_t)gyro_data_raw[3] << 8 | gyro_data_raw[2]);
     gyro_data[2] = (int16_t)((uint16_t)gyro_data_raw[5] << 8 | gyro_data_raw[4]);
 
-    // Output stays in deg/s for upper layer compatibility.
+    //进行单位转换
     data->gyro.x = gyro_data[0] / BMI088_GYRO_SENSITIVITY_2000_DPS;
     data->gyro.y = gyro_data[1] / BMI088_GYRO_SENSITIVITY_2000_DPS;
     data->gyro.z = gyro_data[2] / BMI088_GYRO_SENSITIVITY_2000_DPS;
@@ -154,7 +185,6 @@ void BMI088_ReadTemp(SPI_HandleTypeDef *hspi, imu_data_t *data)
  */
 euler_t BMI088_Complementary_Filter(imu_data_t *data, float dt, float kp, float ki)
 {
-    static quat_t q = {1.0f, 0.0f, 0.0f, 0.0f};
     euler_t euler = {0};
 
     if (data == NULL)
@@ -162,15 +192,13 @@ euler_t BMI088_Complementary_Filter(imu_data_t *data, float dt, float kp, float 
         return euler;
     }
 
-    // Use a local copy to avoid repeatedly scaling raw gyro data.
+    // Use a local copy to avoid touching raw sensor values.
     imu_data_t imu = *data;
     imu.dt = dt;
-    imu.gyro.x = imu.gyro.x * (M_PI / 180.0f);
-    imu.gyro.y = imu.gyro.y * (M_PI / 180.0f);
-    imu.gyro.z = imu.gyro.z * (M_PI / 180.0f);
+    BMI088_MapSensorToBody(&imu);
 
-    mahony_update(&q, imu, kp, ki);
-    euler = quat_to_euler(q);
+    mahony_update(&g_bmi088_quat, imu, kp, ki);
+    euler = quat_to_euler(g_bmi088_quat);
 
     return euler;
 }

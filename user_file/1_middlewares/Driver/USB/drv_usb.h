@@ -34,11 +34,19 @@ struct Struct_USB_Manage_Object
     uint32_t Tx_Busy_Start_Tick;
 
     // ========= 通信存活检测（Alive Guard） =========
-    // 在“收到有效上位机数据”时自增，用于判断最近100ms是否有USB接收
+    // RX方向活动计数：在“收到有效上位机数据”时自增
     volatile uint32_t Alive_Flag;
-    // 100ms检查时保存上次Alive_Flag，与当前比较判定在线/离线
+    // 100ms检查时保存上次RX计数，与当前比较判定RX在线/离线
     uint32_t Alive_Pre_Flag;
-    // 当前在线状态：0=离线，1=在线
+    // TX方向活动计数：在“发送完成回调”时自增
+    volatile uint32_t Tx_Alive_Flag;
+    // 100ms检查时保存上次TX计数，与当前比较判定TX在线/离线
+    uint32_t Tx_Alive_Pre_Flag;
+    // RX在线状态：0=离线，1=在线
+    volatile uint8_t Alive_Rx_Online;
+    // TX在线状态：0=离线，1=在线
+    volatile uint8_t Alive_Tx_Online;
+    // 链路在线状态：0=离线，1=在线（RX在线 || TX在线）
     volatile uint8_t Alive_Online;
     // 状态变化标志：0=未变化，1=状态变化（供任务层消费）
     volatile uint8_t Alive_Changed;
@@ -66,6 +74,10 @@ void USB_TxCplt_Callback(void);
 void USB_Alive_Check_100ms(void);
 // 获取当前USB在线状态：0=离线，1=在线
 uint8_t USB_Alive_IsOnline(void);
+// 获取当前USB-RX在线状态：0=离线，1=在线
+uint8_t USB_Alive_IsRxOnline(void);
+// 获取当前USB-TX在线状态：0=离线，1=在线
+uint8_t USB_Alive_IsTxOnline(void);
 // 任务层消费“在线状态变化事件”，有变化返回1并输出当前online值
 uint8_t USB_Alive_TryConsumeChanged(uint8_t *online);
 
