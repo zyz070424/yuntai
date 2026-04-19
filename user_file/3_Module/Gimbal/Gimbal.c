@@ -1,12 +1,8 @@
 ﻿#include "Gimbal.h"
+#include "gimbal_sentry_target.h"
 #include "alg_pid.h"
-#include "drv_usb.h"
-#include "dvc_motor.h"
-#include "alg_dwt.h"
-#include "portmacro.h"
-#include "stm32f4xx_hal.h"
+#include <stdbool.h>
 #include <stdint.h>
-#include <math.h>
 #define PI   3.1415926f
 #define GIMBAL_CTRL_PERIOD_TICK     1
 #define GIMBAL_CTRL_DT              0.001f
@@ -32,282 +28,151 @@
 // 电机输出限幅（GM6020电压模式常用范围）
 #define GIMBAL_MOTOR_CMD_LIMIT      10000.0f
 
-// Yaw测试信号与串级整形参数
-#define GIMBAL_YAW_TEST_FREQ_HZ              0.30f
-#define GIMBAL_YAW_TEST_AMP_DEG              35.0f
-#define GIMBAL_YAW_TARGET_SPEED_TAU_S        0.030f
-#define GIMBAL_YAW_TARGET_SPEED_SLEW_RAD_S2  8.0f
+// 哨兵扫描正弦波参数：默认绕 0 度中心摆动，只需改幅值和频率
+#define GIMBAL_SCAN_YAW_AMPLITUDE_DEG        50.0f
+#define GIMBAL_SCAN_PITCH_AMPLITUDE_DEG      37.0f
+#define GIMBAL_SCAN_YAW_FREQ_HZ              0.2f
+#define GIMBAL_SCAN_PITCH_FREQ_HZ            0.2f
+#define GIMBAL_LOST_RETURN_SPEED_DEG_S       110.0f
+#define GIMBAL_LOST_RETURN_NEAR_DEG          1.0f
+#define GIMBAL_VISION_TRACK_TIMEOUT_MS       120u
+#define GIMBAL_VISION_TARGET_FILTER_TAU_S    0.010f
+#define GIMBAL_TRACK_SHAPER_MEDIUM_ENTER_DEG 2.0f
+#define GIMBAL_TRACK_SHAPER_MEDIUM_EXIT_DEG  3.0f
+#define GIMBAL_TRACK_SHAPER_FINE_ENTER_DEG   0.8f
+#define GIMBAL_TRACK_SHAPER_FINE_EXIT_DEG    1.2f
+#define GIMBAL_SCAN_SHAPER_FILTER_TAU_S      0.003f
+#define GIMBAL_PITCH_SCAN_SHAPER_SLEW_RATE   30.0f
+#define GIMBAL_YAW_SCAN_SHAPER_SLEW_RATE     30.0f
+#define GIMBAL_PITCH_TRACK_FAST_FILTER_TAU_S 0.0010f
+#define GIMBAL_PITCH_TRACK_MID_FILTER_TAU_S  0.0020f
+#define GIMBAL_PITCH_TRACK_FINE_FILTER_TAU_S 0.0035f
+#define GIMBAL_YAW_TRACK_FAST_FILTER_TAU_S   0.0010f
+#define GIMBAL_YAW_TRACK_MID_FILTER_TAU_S    0.0020f
+#define GIMBAL_YAW_TRACK_FINE_FILTER_TAU_S   0.0035f
+#define GIMBAL_PITCH_TRACK_FAST_SLEW_RATE    180.0f
+#define GIMBAL_PITCH_TRACK_MID_SLEW_RATE     80.0f
+#define GIMBAL_PITCH_TRACK_FINE_SLEW_RATE    30.0f
+#define GIMBAL_YAW_TRACK_FAST_SLEW_RATE      200.0f
+#define GIMBAL_YAW_TRACK_MID_SLEW_RATE       90.0f
+#define GIMBAL_YAW_TRACK_FINE_SLEW_RATE      35.0f
 
 // Yaw外环参数（角度环 -> 速度目标）
-#define GIMBAL_YAW_ANGLE_KP                  0.12f
+#define GIMBAL_YAW_ANGLE_KP                  0.2f
 #define GIMBAL_YAW_ANGLE_KI                  0.1f
 #define GIMBAL_YAW_ANGLE_KD                  0.00f
-#define GIMBAL_YAW_ANGLE_OUT_LIMIT           4.0f
+#define GIMBAL_YAW_ANGLE_FEEDFORWARD         0.025
+#define GIMBAL_YAW_ANGLE_OUT_LIMIT           10.0f
 #define GIMBAL_YAW_ANGLE_I_LIMIT             1.5f
-#define GIMBAL_YAW_ANGLE_DEADBAND_DEG        0.4f
+#define GIMBAL_YAW_ANGLE_DEADBAND_DEG        0.0f
 
 // Yaw内环参数（速度环 -> 电机控制量）
-#define GIMBAL_YAW_SPEED_KP                  2500.0f
-#define GIMBAL_YAW_SPEED_KI                  700.0f
+#define GIMBAL_YAW_SPEED_KP                  1400.0f
+#define GIMBAL_YAW_SPEED_KI                  600.0f
 #define GIMBAL_YAW_SPEED_KD                  0.00f
 #define GIMBAL_YAW_SPEED_I_LIMIT             2000.0f
 
-// Pitch测试信号与串级整形参数（与Yaw同结构）
-#define GIMBAL_PITCH_TEST_FREQ_HZ              0.60f
-#define GIMBAL_PITCH_TEST_AMP_DEG              40.0f
-#define GIMBAL_PITCH_TARGET_SPEED_TAU_S        0.020f
-#define GIMBAL_PITCH_TARGET_SPEED_SLEW_RAD_S2  12.0f
+// #define GIMBAL_YAW_SPEED_KP                  0.0f
+// #define GIMBAL_YAW_SPEED_KI                  0.0f
+// #define GIMBAL_YAW_SPEED_KD                  0.00f
+// #define GIMBAL_YAW_SPEED_I_LIMIT             2000.0f
 
-// Pitch外环参数（角度环 -> 速度目标）
-#define GIMBAL_PITCH_ANGLE_KP                  0.14f
+
+//sin测试函数
+#define GIMBAL_TEST_TARGET          30.0f
+#define GIMBAL_TEST_FREQ_HZ         1.25f
+
+//Pitch外环参数（角度环 -> 速度目标）
+#define GIMBAL_PITCH_ANGLE_KP                  0.6f
 #define GIMBAL_PITCH_ANGLE_KI                  0.1f
 #define GIMBAL_PITCH_ANGLE_KD                  0.00f
-#define GIMBAL_PITCH_ANGLE_OUT_LIMIT           4.5f
+#define GIMBAL_PITCH_ANGLE_FEEDFORWARD         0.02
+#define GIMBAL_PITCH_ANGLE_OUT_LIMIT           10.0f
 #define GIMBAL_PITCH_ANGLE_I_LIMIT             1.5f
 #define GIMBAL_PITCH_ANGLE_DEADBAND_DEG        0.4f
 
+
+
+
 // Pitch内环参数（速度环 -> 电机控制量）
-#define GIMBAL_PITCH_SPEED_KP                  1100.0f
-#define GIMBAL_PITCH_SPEED_KI                  280.0f
+#define GIMBAL_PITCH_SPEED_KP                  1300.0f
+#define GIMBAL_PITCH_SPEED_KI                  600.0f
 #define GIMBAL_PITCH_SPEED_KD                  0.00f
 #define GIMBAL_PITCH_SPEED_I_LIMIT             2000.0f
-// 运行时锁零掩码：支持按轴选择
-#define GIMBAL_ZERO_LOCK_PITCH      (1 << 0)
-#define GIMBAL_ZERO_LOCK_YAW        (1 << 1)
-#define GIMBAL_ZERO_LOCK_BOTH       (GIMBAL_ZERO_LOCK_PITCH | GIMBAL_ZERO_LOCK_YAW)
-
+//这个是调试使用的
+// #define GIMBAL_PITCH_SPEED_KP                  0.0f
+// #define GIMBAL_PITCH_SPEED_KI                  0.0f
+// #define GIMBAL_PITCH_SPEED_KD                  0.00f
+//  #define GIMBAL_PITCH_SPEED_I_LIMIT             2000.0f
 Motor_TypeDef Gimbal_Motor_Pitch;
 Motor_TypeDef Gimbal_Motor_Yaw;
 imu_data_t Gimbal_IMU_Data;
 euler_t Gimbal_Euler_Angle_to_send;
-extern Manifold_UART_Rx_Data Rx_Data;
 Manifold_UART_Tx_Data Tx_Data;
 
-static float g_gimbal_pitch_target = 0.0f;
-static float g_gimbal_yaw_target = 0.0f;
-static float g_gimbal_pitch_zero = 0.0f;
-static float g_gimbal_yaw_zero = 0.0f;
-static uint8_t g_zero_locked_mask = 0;
 #if GIMBAL_IMU_DRDY_ENABLE
 static TaskHandle_t g_gimbal_imu_task_handle = NULL;
 #endif
 static alg_dwt_timebase_t g_gimbal_imu_timebase;
 volatile float g_gimbal_imu_last_dt_s = GIMBAL_IMU_DT_DEFAULT_S;
 volatile uint8_t g_gimbal_imu_last_dt_from_dwt = 0;
-static uint8_t g_gimbal_yaw_continuous_inited = 0u;
-static float g_gimbal_yaw_zero_raw_deg = 0.0f;
-static float g_gimbal_yaw_last_rel_wrapped_deg = 0.0f;
-static float g_gimbal_yaw_continuous_deg = 0.0f;
-volatile float g_gimbal_yaw_raw_deg = 0.0f;
-volatile float g_gimbal_yaw_send_deg = 0.0f;
-float Target_Yaw = GIMBAL_YAW_TEST_AMP_DEG;
-// 测试用：单轴正弦目标
-float Target_Pitch = GIMBAL_PITCH_TEST_AMP_DEG;
-static float g_gimbal_yaw_test_phase = 0.0f;
-static float g_gimbal_pitch_test_phase = 0.0f;
 
-/**
- * @brief   生成幅值周期翻转的阶跃信号
- * @param   elapsed_ms: 当前已运行时间（毫秒）
- * @param   flip_interval_ms: 每次翻转间隔（毫秒）
- * @param   amplitude: 阶跃幅值，输出将在 +amplitude 和 -amplitude 之间切换
- * @retval  当前时刻对应的翻转阶跃信号值
- * @note    使用示例：
- *          target = Gimbal_Generate_Flip_Step_Signal(gyro_test_time_ms, 1000u, 20.0f);
- *          这表示每 1000ms 翻转一次，在 +20 和 -20 之间切换。
- */
-static float Gimbal_Generate_Flip_Step_Signal(uint32_t elapsed_ms,
-                                              uint32_t flip_interval_ms,
-                                              float amplitude)
+
+
+
+float yaw_output = 1;
+
+// 哨兵目标生成配置仍放在 Gimbal.c，便于结合本云台机械范围统一调参
+static const Gimbal_Sentry_Target_Config_TypeDef g_gimbal_sentry_target_config =
 {
-    float amplitude_abs;
-    uint32_t flip_count;
-
-    if (isfinite(amplitude) == 0)
+    .control_dt_s = GIMBAL_CTRL_DT,
+    .vision_track_timeout_ms = GIMBAL_VISION_TRACK_TIMEOUT_MS,
+    .vision_target_filter_tau_s = GIMBAL_VISION_TARGET_FILTER_TAU_S,
+    .sentry_config =
     {
-        return 0.0f;
+        .dt_s = GIMBAL_CTRL_DT,
+        .pitch_min_deg = GIMBAL_PITCH_MIN_ANGLE,
+        .pitch_max_deg = GIMBAL_PITCH_MAX_ANGLE,
+        .yaw_min_deg = GIMBAL_YAW_MIN_ANGLE,
+        .yaw_max_deg = GIMBAL_YAW_MAX_ANGLE,
+        .scan_pitch_amplitude_deg = GIMBAL_SCAN_PITCH_AMPLITUDE_DEG,
+        .scan_yaw_amplitude_deg = GIMBAL_SCAN_YAW_AMPLITUDE_DEG,
+        .scan_pitch_frequency_hz = GIMBAL_SCAN_PITCH_FREQ_HZ,
+        .scan_yaw_frequency_hz = GIMBAL_SCAN_YAW_FREQ_HZ,
+        .lost_return_speed_deg_s = GIMBAL_LOST_RETURN_SPEED_DEG_S,
+        .lost_return_near_deg = GIMBAL_LOST_RETURN_NEAR_DEG
     }
-
-    if (flip_interval_ms == 0u)
-    {
-        return 0.0f;
-    }
-
-    amplitude_abs = fabsf(amplitude);
-    if (amplitude_abs <= 0.0f)
-    {
-        return 0.0f;
-    }
-
-    flip_count = elapsed_ms / flip_interval_ms;
-    if ((flip_count & 1u) == 0u)
-    {
-        return amplitude_abs;
-    }
-
-    return -amplitude_abs;
-}
-
+};
 /**
- * @brief   将角度限制到 [-180, 180) 区间
- * @param  angle_deg: 输入角度（deg）
- * @retval 区间化后的角度（deg）
+ * @brief 跟踪态角度环输出整形配置。
+ * @note  大误差区保留更快的响应，小误差锁定区自动收紧斜率限制和低通时间常数。
  */
-static float Gimbal_Wrap180(float angle_deg)
+static const PID_Output_Schedule_Config_TypeDef g_gimbal_pitch_track_shaper_config =
 {
-    while (angle_deg >= 180.0f)
-    {
-        angle_deg -= 360.0f;
-    }
-
-    while (angle_deg < -180.0f)
-    {
-        angle_deg += 360.0f;
-    }
-
-    return angle_deg;
-}
-
-/**
- * @brief   重置yaw连续化状态（用于上电首次/链路恢复）
- * @retval 无
- */
-static void Gimbal_Yaw_Continuous_Reset(void)
+    .medium_enter_error = GIMBAL_TRACK_SHAPER_MEDIUM_ENTER_DEG,
+    .medium_exit_error = GIMBAL_TRACK_SHAPER_MEDIUM_EXIT_DEG,
+    .fine_enter_error = GIMBAL_TRACK_SHAPER_FINE_ENTER_DEG,
+    .fine_exit_error = GIMBAL_TRACK_SHAPER_FINE_EXIT_DEG,
+    .fast_filter_tau_s = GIMBAL_PITCH_TRACK_FAST_FILTER_TAU_S,
+    .medium_filter_tau_s = GIMBAL_PITCH_TRACK_MID_FILTER_TAU_S,
+    .fine_filter_tau_s = GIMBAL_PITCH_TRACK_FINE_FILTER_TAU_S,
+    .fast_slew_rate = GIMBAL_PITCH_TRACK_FAST_SLEW_RATE,
+    .medium_slew_rate = GIMBAL_PITCH_TRACK_MID_SLEW_RATE,
+    .fine_slew_rate = GIMBAL_PITCH_TRACK_FINE_SLEW_RATE
+};
+static const PID_Output_Schedule_Config_TypeDef g_gimbal_yaw_track_shaper_config =
 {
-    g_gimbal_yaw_continuous_inited = 0u;
-    g_gimbal_yaw_zero_raw_deg = 0.0f;
-    g_gimbal_yaw_last_rel_wrapped_deg = 0.0f;
-    g_gimbal_yaw_continuous_deg = 0.0f;
-    g_gimbal_yaw_raw_deg = 0.0f;
-    g_gimbal_yaw_send_deg = 0.0f;
-}
-
-/**
- * @brief   将姿态解算输出yaw转为“上电归零 + 连续角”
- * @param  raw_yaw_deg: 姿态解算原始yaw（通常在[-180,180)）
- * @retval 连续yaw（deg）
- */
-static float Gimbal_Yaw_To_Continuous(float raw_yaw_deg)
-{
-    float yaw_rel_wrapped_deg;
-    float dyaw_deg;
-
-    if (isfinite(raw_yaw_deg) == 0)
-    {
-        return g_gimbal_yaw_continuous_deg;
-    }
-
-    g_gimbal_yaw_raw_deg = raw_yaw_deg;
-
-    // 首次样本：锁定零偏，保证上电初值为0°
-    if (g_gimbal_yaw_continuous_inited == 0u)
-    {
-        g_gimbal_yaw_zero_raw_deg = raw_yaw_deg;
-        g_gimbal_yaw_last_rel_wrapped_deg = 0.0f;
-        g_gimbal_yaw_continuous_deg = 0.0f;
-        g_gimbal_yaw_continuous_inited = 1u;
-        g_gimbal_yaw_send_deg = 0.0f;
-        return 0.0f;
-    }
-
-    // 先做上电归零，再做区间化，避免+180/-180边界抖动
-    yaw_rel_wrapped_deg = Gimbal_Wrap180(raw_yaw_deg - g_gimbal_yaw_zero_raw_deg);
-    dyaw_deg = yaw_rel_wrapped_deg - g_gimbal_yaw_last_rel_wrapped_deg;
-
-    if (dyaw_deg > 180.0f)
-    {
-        dyaw_deg -= 360.0f;
-    }
-    else if (dyaw_deg < -180.0f)
-    {
-        dyaw_deg += 360.0f;
-    }
-
-    g_gimbal_yaw_continuous_deg += dyaw_deg;
-    g_gimbal_yaw_last_rel_wrapped_deg = yaw_rel_wrapped_deg;
-    g_gimbal_yaw_send_deg = g_gimbal_yaw_continuous_deg;
-
-    return g_gimbal_yaw_continuous_deg;
-}
-/**
- * @brief   CAN断联保护动作
- * @param   无
- * @retval  无
- * @note    这里做“软保护”：
- *          - 清积分，防止恢复时积分冲击
- *          - 目标角归零，避免断联期间目标继续漂移
- */
-static void Gimbal_CAN_Offline_Protect(void)
-{
-    Gimbal_Motor_Pitch.PID[0].integral = 0.0f;
-    Gimbal_Motor_Pitch.PID[1].integral = 0.0f;
-    Gimbal_Motor_Yaw.PID[0].integral = 0.0f;
-    Gimbal_Motor_Yaw.PID[1].integral = 0.0f;
-
-    g_gimbal_pitch_target = 0.0f;
-    g_gimbal_yaw_target = 0.0f;
-   
-}
-
-/**
- * @brief   CAN恢复在线后的动作
- * @param   无
- * @retval  无
- * @note    当前恢复时不额外处理，预留扩展点
- */
-static void Gimbal_CAN_Online_Protect(void)
-{
-
-}
-
-/**
- * @brief   SPI断联保护动作
- * @param   无
- * @retval  无
- * @note    当前策略：将对外发送欧拉角清零，避免持续发送陈旧姿态
- */
-static void Gimbal_SPI_Offline_Protect(void)
-{
-    Gimbal_Yaw_Continuous_Reset();
-    Gimbal_Euler_Angle_to_send.roll = 0.0f;
-    Gimbal_Euler_Angle_to_send.pitch = 0.0f;
-    Gimbal_Euler_Angle_to_send.yaw = 0.0f;
-}
-
-/**
- * @brief   SPI恢复在线后的动作
- * @param   无
- * @retval  无
- */
-static void Gimbal_SPI_Online_Protect(void)
-{
-    Gimbal_Yaw_Continuous_Reset();
-}
-
-/**
- * @brief   USB断联保护动作
- * @param   无
- * @retval  无
- * @note    清空视觉增量和关键控制字段，避免断联后沿用陈旧数据
- */
-static void Gimbal_USB_Offline_Protect(void)
-{
-    //Rx_Data.Shoot_Flag = 0;
-    Rx_Data.Taget_Pitch = 0.0f;
-    Rx_Data.Taget_Yaw = 0.0f;
-    //Rx_Data.Enemy_ID = Manifold_Enemy_ID_NONE_0;
-    //Rx_Data.Confidence_Level = 0;
-}
-
-/**
- * @brief   USB恢复在线后的动作
- * @param   无
- * @retval  无
- * @note    当前恢复时不额外处理，预留扩展点
- */
-static void Gimbal_USB_Online_Protect(void)
-{
-}
+    .medium_enter_error = GIMBAL_TRACK_SHAPER_MEDIUM_ENTER_DEG,
+    .medium_exit_error = GIMBAL_TRACK_SHAPER_MEDIUM_EXIT_DEG,
+    .fine_enter_error = GIMBAL_TRACK_SHAPER_FINE_ENTER_DEG,
+    .fine_exit_error = GIMBAL_TRACK_SHAPER_FINE_EXIT_DEG,
+    .fast_filter_tau_s = GIMBAL_YAW_TRACK_FAST_FILTER_TAU_S,
+    .medium_filter_tau_s = GIMBAL_YAW_TRACK_MID_FILTER_TAU_S,
+    .fine_filter_tau_s = GIMBAL_YAW_TRACK_FINE_FILTER_TAU_S,
+    .fast_slew_rate = GIMBAL_YAW_TRACK_FAST_SLEW_RATE,
+    .medium_slew_rate = GIMBAL_YAW_TRACK_MID_SLEW_RATE,
+    .fine_slew_rate = GIMBAL_YAW_TRACK_FINE_SLEW_RATE
+};
 
 /**
  * @brief   云台角度限幅函数
@@ -332,104 +197,121 @@ static float Gimbal_Clamp(float value, float min_value, float max_value)
 }
 
 /**
- * @brief   清空某个电机所有已启用PID的运行状态（不改参数）
- * @param  motor: 电机对象
+ * @brief 根据当前哨兵状态为角度环选择输出整形参数。
+ * @param pid 角度环 PID 指针
+ * @param angle_error_deg 当前角度误差（单位：度）
+ * @param track_config 跟踪态分段整形配置
+ * @param default_filter_tau_s 非跟踪态默认低通时间常数
+ * @param default_slew_rate 非跟踪态默认斜率限制
+ * @retval 无
+ * @note  自适应整形只在 TRACK_ARMOR 状态启用，避免影响扫描与回扫阶段的既有手感。
+ */
+static void Gimbal_Update_Angle_Output_Shaping(PID_TypeDef *pid,
+                                               float angle_error_deg,
+                                               const PID_Output_Schedule_Config_TypeDef *track_config,
+                                               float default_filter_tau_s,
+                                               float default_slew_rate)
+{
+    if (pid == NULL)
+    {
+        return;
+    }
+
+    if (Gimbal_Sentry_Target_Get_State() == GIMBAL_SENTRY_STATE_TRACK_ARMOR)
+    {
+        PID_Output_Schedule_Apply(pid, angle_error_deg, track_config);
+        return;
+    }
+
+    PID_Output_Schedule_Reset(pid, PID_OUTPUT_SCHEDULE_MODE_FAST);
+    PID_Output_Filter_Enable(pid, default_filter_tau_s > 0.0f, default_filter_tau_s);
+    PID_Output_Slew_Enable(pid, default_slew_rate > 0.0f, default_slew_rate);
+}
+
+static float Gimbal_Yaw_Speed_Test_Sine_Target(void)
+{
+    static float test_time_s = 0.0f;
+    const float angular_frequency = 2.0f * PI * GIMBAL_TEST_FREQ_HZ;
+    const float sine_period_s = 1.0f / GIMBAL_TEST_FREQ_HZ;
+    float target_speed;
+
+    target_speed = GIMBAL_TEST_TARGET * sinf(angular_frequency * test_time_s);
+    test_time_s += GIMBAL_CTRL_DT;
+
+    if (test_time_s >= sine_period_s)
+    {
+        test_time_s -= sine_period_s;
+    }
+
+    return target_speed;
+}
+
+/**
+ * @brief   复位当前控制目标
  * @retval 无
  */
-static void Gimbal_PID_Clear_Runtime(Motor_TypeDef *motor)
+void Gimbal_Reset_Control_Targets(void)
 {
-    uint8_t i;
-
-    if (motor == NULL)
-    {
-        return;
-    }
-
-    for (i = 0; i < motor->PID_Use_Count && i < 2; i++)
-    {
-        motor->PID[i].integral = 0.0f;
-        motor->PID[i].error = 0.0f;
-        motor->PID[i].prev_error = 0.0f;
-        motor->PID[i].target = 0.0f;
-        motor->PID[i].prev_target = 0.0f;
-        motor->PID[i].output = 0.0f;
-        motor->PID[i].output_shaper_state = 0.0f;
-        motor->PID[i].output_shaper_inited = true;
-    }
+    Gimbal_Sentry_Target_Clear_Output();
 }
 
 /**
- * @brief   判断指定轴的编码器反馈是否就绪
- * @param  axis_mask: GIMBAL_ZERO_LOCK_PITCH / GIMBAL_ZERO_LOCK_YAW / 组合
- * @retval 1=就绪，0=未就绪
- */
-static uint8_t Gimbal_Is_Encoder_Ready(uint8_t axis_mask)
-{
-    if (((axis_mask & GIMBAL_ZERO_LOCK_PITCH) != 0) &&
-        (Gimbal_Motor_Pitch.RxData.Encoder_Initialized == 0))
-    {
-        return 0;
-    }
-
-    if (((axis_mask & GIMBAL_ZERO_LOCK_YAW) != 0) &&
-        (Gimbal_Motor_Yaw.RxData.Encoder_Initialized == 0))
-    {
-        return 0;
-    }
-
-    return 1;
-}
-
-/**
- * @brief   尝试按掩码锁零（可按轴选择）
- * @param  axis_mask: GIMBAL_ZERO_LOCK_PITCH / GIMBAL_ZERO_LOCK_YAW / 组合
- * @param  require_all_ready: 1=要求掩码内所有轴都ready才执行，0=ready哪个锁哪个
+ * @brief   清空IMU对外输出
  * @retval 无
  */
-static void Gimbal_Try_Lock_Zero(uint8_t axis_mask, uint8_t require_all_ready)
+void Gimbal_Reset_Imu_Output(void)
 {
-    uint8_t valid_mask = (uint8_t)(axis_mask & GIMBAL_ZERO_LOCK_BOTH);
-
-    if (valid_mask == 0)
-    {
-        return;
-    }
-
-    if ((require_all_ready != 0) && (Gimbal_Is_Encoder_Ready(valid_mask) == 0))
-    {
-        return;
-    }
-
-    if (((valid_mask & GIMBAL_ZERO_LOCK_PITCH) != 0) &&
-        ((g_zero_locked_mask & GIMBAL_ZERO_LOCK_PITCH) == 0) &&
-        (Gimbal_Motor_Pitch.RxData.Encoder_Initialized != 0))
-    {
-        g_gimbal_pitch_zero = Gimbal_Motor_Pitch.RxData.Angle;
-        g_gimbal_pitch_target = 0.0f;
-        Gimbal_PID_Clear_Runtime(&Gimbal_Motor_Pitch);
-        g_zero_locked_mask |= GIMBAL_ZERO_LOCK_PITCH;
-    }
-
-    if (((valid_mask & GIMBAL_ZERO_LOCK_YAW) != 0) &&
-        ((g_zero_locked_mask & GIMBAL_ZERO_LOCK_YAW) == 0) &&
-        (Gimbal_Motor_Yaw.RxData.Encoder_Initialized != 0))
-    {
-        g_gimbal_yaw_zero = Gimbal_Motor_Yaw.RxData.Angle;
-        g_gimbal_yaw_target = 0.0f;
-        Gimbal_PID_Clear_Runtime(&Gimbal_Motor_Yaw);
-        g_zero_locked_mask |= GIMBAL_ZERO_LOCK_YAW;
-    }
+    BMI088_Yaw_Continuous_Reset();
+    Gimbal_Euler_Angle_to_send.roll = 0.0f;
+    Gimbal_Euler_Angle_to_send.pitch = 0.0f;
+    Gimbal_Euler_Angle_to_send.yaw = 0.0f;
 }
 
 /**
- * @brief   判断指定轴是否已锁零
- * @param  axis_mask: GIMBAL_ZERO_LOCK_PITCH / GIMBAL_ZERO_LOCK_YAW / 组合
- * @retval 1=已全部锁零，0=未全部锁零
+ * @brief CAN 在线状态变化处理
+ * @param online 0=离线 1=在线
  */
-static uint8_t Gimbal_Is_Zero_Locked(uint8_t axis_mask)
+static void Gimbal_Device_Check_Handle_CAN_Change(uint8_t online)
 {
-    uint8_t valid_mask = (uint8_t)(axis_mask & GIMBAL_ZERO_LOCK_BOTH);
-    return ((g_zero_locked_mask & valid_mask) == valid_mask) ? 1 : 0;
+    if (online != 0u)
+    {
+        return;
+    }
+
+    Motor_Clear_Runtime(&Gimbal_Motor_Pitch);
+    Motor_Clear_Runtime(&Gimbal_Motor_Yaw);
+    Gimbal_Reset_Control_Targets();
+}
+
+/**
+ * @brief SPI 在线状态变化处理
+ * @param online 0=离线 1=在线
+ */
+static void Gimbal_Device_Check_Handle_SPI_Change(uint8_t online)
+{
+    if (online == 0u)
+    {
+        Gimbal_Reset_Imu_Output();
+        return;
+    }
+
+    BMI088_Yaw_Continuous_Reset();
+}
+
+/**
+ * @brief USB 在线状态变化处理。
+ * @param online 0=离线 1=在线
+ * @note  USB 离线时同时清空协议层目标和上层有效目标缓存，避免恢复在线后沿用旧目标。
+ */
+static void Gimbal_Device_Check_Handle_USB_Change(uint8_t online)
+{
+    if (online != 0u)
+    {
+        return;
+    }
+
+    Manifold_Clear_Target();
+    Gimbal_Sentry_Target_Reset_Vision();
 }
 
 /**
@@ -474,6 +356,34 @@ static int16_t Gimbal_Output_To_CAN_Normal(float value)
 }
 
 /**
+ * @brief   Pitch/Yaw 共帧时合帧发送，否则回退为原来的逐电机发送
+ * @param   pitch_cmd: Pitch 电机控制量
+ * @param   yaw_cmd: Yaw 电机控制量
+ * @retval  无
+ */
+static void Gimbal_Send_Pitch_Yaw_CAN(int16_t pitch_cmd, int16_t yaw_cmd)
+{
+    uint32_t pitch_send_id;
+    uint32_t yaw_send_id;
+
+    pitch_send_id = Motor_Get_CAN_Send_Id(&Gimbal_Motor_Pitch);
+    yaw_send_id = Motor_Get_CAN_Send_Id(&Gimbal_Motor_Yaw);
+
+    if ((Gimbal_Motor_Pitch.can == Gimbal_Motor_Yaw.can) &&
+        (pitch_send_id != 0u) &&
+        (pitch_send_id == yaw_send_id))
+    {
+        Motor_Update_CAN_Cache(&Gimbal_Motor_Pitch, pitch_cmd);
+        Motor_Update_CAN_Cache(&Gimbal_Motor_Yaw, yaw_cmd);
+        Motor_Send_CAN_Frame_By_Id(Gimbal_Motor_Pitch.can, pitch_send_id);
+        return;
+    }
+
+    Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, pitch_cmd);
+    Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, yaw_cmd);
+}
+
+/**
  * @brief   云台初始化函数
  * @param  pramas: 无
  * @retval 无
@@ -483,7 +393,7 @@ void Gimbal_Init(void* pramas)
     (void)pramas;
 
     // 初始化视觉通信
-    Manifold_Init(&Tx_Data, 0xFE, 0xFF, Manifold_Sentry_Mode_DISABLE);
+    Manifold_Init(&Tx_Data, 0xFE, 0xFF, Manifold_Sentry_Mode_ENABLE);
 
     // 启动电机所在CAN总线
     CAN_Start(&hcan2);
@@ -498,7 +408,7 @@ void Gimbal_Init(void* pramas)
     Motor_Init(&Gimbal_Motor_Pitch, 4, GM6020_Voltage, &hcan2, DJI_Control_Method_Angle);
     // PID[1]: 角度外环，输出目标速度（小限幅）
     Motor_Set_PID_Params(&Gimbal_Motor_Pitch, 1,
-                         GIMBAL_PITCH_ANGLE_KP, GIMBAL_PITCH_ANGLE_KI, GIMBAL_PITCH_ANGLE_KD, 0.00f,
+                         GIMBAL_PITCH_ANGLE_KP, GIMBAL_PITCH_ANGLE_KI, GIMBAL_PITCH_ANGLE_KD, GIMBAL_PITCH_ANGLE_FEEDFORWARD,
                          -GIMBAL_PITCH_ANGLE_OUT_LIMIT, GIMBAL_PITCH_ANGLE_OUT_LIMIT,
                          -GIMBAL_PITCH_ANGLE_I_LIMIT, GIMBAL_PITCH_ANGLE_I_LIMIT);
     // PID[0]: 速度内环，输出最终电机控制量（大限幅）
@@ -506,17 +416,11 @@ void Gimbal_Init(void* pramas)
                          GIMBAL_PITCH_SPEED_KP, GIMBAL_PITCH_SPEED_KI, GIMBAL_PITCH_SPEED_KD, 0.00f,
                          -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT,
                          -GIMBAL_PITCH_SPEED_I_LIMIT, GIMBAL_PITCH_SPEED_I_LIMIT);
-    // 角度外环输出整形（放在PID层）：低通 + 斜率限制
-    PID_Output_Filter_Enable(&Gimbal_Motor_Pitch.PID[1], true, GIMBAL_PITCH_TARGET_SPEED_TAU_S);
-    PID_Output_Slew_Enable(&Gimbal_Motor_Pitch.PID[1], true, GIMBAL_PITCH_TARGET_SPEED_SLEW_RAD_S2);
-    // 启用死区，避免小信号时电机抖动
-    //PID_Deadband_Enable(&Gimbal_Motor_Pitch.PID[1], 1, GIMBAL_PITCH_ANGLE_DEADBAND_DEG);
-
     // 偏航电机：角度外环 + 速度内环
     Motor_Init(&Gimbal_Motor_Yaw, 2, GM6020_Voltage, &hcan2, DJI_Control_Method_Angle);
     // PID[1]: 角度外环，输出目标速度（小限幅）
     Motor_Set_PID_Params(&Gimbal_Motor_Yaw, 1,
-                         GIMBAL_YAW_ANGLE_KP, GIMBAL_YAW_ANGLE_KI, GIMBAL_YAW_ANGLE_KD, 0.00f,
+                         GIMBAL_YAW_ANGLE_KP, GIMBAL_YAW_ANGLE_KI, GIMBAL_YAW_ANGLE_KD, GIMBAL_YAW_ANGLE_FEEDFORWARD,
                          -GIMBAL_YAW_ANGLE_OUT_LIMIT, GIMBAL_YAW_ANGLE_OUT_LIMIT,
                          -GIMBAL_YAW_ANGLE_I_LIMIT, GIMBAL_YAW_ANGLE_I_LIMIT);
     // PID[0]: 速度内环，输出最终电机控制量（大限幅）
@@ -524,36 +428,39 @@ void Gimbal_Init(void* pramas)
                          GIMBAL_YAW_SPEED_KP, GIMBAL_YAW_SPEED_KI, GIMBAL_YAW_SPEED_KD, 0.00f,
                          -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT,
                          -GIMBAL_YAW_SPEED_I_LIMIT, GIMBAL_YAW_SPEED_I_LIMIT);
-    // 角度外环输出整形（放在PID层）：低通 + 斜率限制
-    //PID_Output_Filter_Enable(&Gimbal_Motor_Yaw.PID[1], true, GIMBAL_YAW_TARGET_SPEED_TAU_S);
-    //PID_Output_Slew_Enable(&Gimbal_Motor_Yaw.PID[1], true, GIMBAL_YAW_TARGET_SPEED_SLEW_RAD_S2);
-    // 启用死区，避免小信号时电机抖动
-   
-    // 运行时参考系状态清零，后续在控制任务中按轴锁零
-    g_gimbal_pitch_target = 0.0f;
-    g_gimbal_yaw_target = 0.0f;
-    g_gimbal_pitch_zero = 0.0f;
-    g_gimbal_yaw_zero = 0.0f;
-    g_zero_locked_mask = 0;
+    //速度环的阻力补偿
+    PID_Friction_Compensation_Enable(&Gimbal_Motor_Yaw.PID[0], true ,1200.0f,0.0f, 0.3, true );
+    PID_Friction_Compensation_Enable(&Gimbal_Motor_Pitch.PID[0], true, 1000.0f, 0.0f, 0.3f, true);
+    //一阶低通
+    PID_Output_Filter_Enable(&Gimbal_Motor_Pitch.PID[1], true, GIMBAL_SCAN_SHAPER_FILTER_TAU_S);
+    PID_Output_Slew_Enable(&Gimbal_Motor_Pitch.PID[1], true, GIMBAL_PITCH_SCAN_SHAPER_SLEW_RATE);
+    
+    PID_Output_Filter_Enable(&Gimbal_Motor_Yaw.PID[1], true, GIMBAL_SCAN_SHAPER_FILTER_TAU_S);
+    PID_Output_Slew_Enable(&Gimbal_Motor_Yaw.PID[1], true, GIMBAL_YAW_SCAN_SHAPER_SLEW_RATE);
+    PID_Deadband_Enable(&Gimbal_Motor_Yaw.PID[1],true,0.08);
+    Gimbal_Sentry_Target_Init(&g_gimbal_sentry_target_config);
 }
 
 
 
 /**
- * @brief   云台双轴PID测试任务（1kHz）
+ * @brief   云台双轴控制任务（1kHz）
  * @param  params: 无
  * @retval 无
- * @note    使用相对角反馈，便于串级PID联调
+ * @note    当前使用 SCAN / TRACK_ARMOR / LOST_TARGET_RETURN_SCAN 三态目标生成
  */
 void Gimbal_Motor_Control_ALL_Test(void* params)
 {
     TickType_t time;
+    TickType_t now_tick;
     uint8_t can_online;
+    uint8_t yaw_feedback_ready;
     float pitch_output;
-    float pitch_target_speed = 1.5;
+    float pitch_target_deg;
+    float pitch_target_speed ;
     float yaw_output;
+    float yaw_target_deg;
     float yaw_target_speed;
-    static uint32_t cnt;
     static int16_t (* const can_output_map[2])(float) =
     {
         Gimbal_Output_To_CAN_Zero,
@@ -565,12 +472,7 @@ void Gimbal_Motor_Control_ALL_Test(void* params)
 
     time = xTaskGetTickCount();
 
-    // 测试任务启动时重置本次运行参考系
-    g_gimbal_pitch_target = 0.0f;
-    g_gimbal_yaw_target = 0.0f;
-    g_gimbal_pitch_zero = 0.0f;
-    g_gimbal_yaw_zero = 0.0f;
-    g_zero_locked_mask = 0;
+    Gimbal_Sentry_Target_Reset_Mode();
 
     pitch_output = 0.0f;
     yaw_output = 0.0f;
@@ -582,50 +484,38 @@ void Gimbal_Motor_Control_ALL_Test(void* params)
         Motor_CAN_Data_Receive(&Gimbal_Motor_Pitch);
         Motor_CAN_Data_Receive(&Gimbal_Motor_Yaw);
 
-       // Pitch使用IMU世界坐标，不做锁零门控；仅Yaw需要锁零
-        if (Gimbal_Is_Zero_Locked(GIMBAL_ZERO_LOCK_YAW) == 0u)
-        {
-            Gimbal_Try_Lock_Zero(GIMBAL_ZERO_LOCK_YAW, 1u);
-        }
-
-        // 未完成Yaw锁零前，不进入闭环，保持零输出避免误动作
-        if (Gimbal_Is_Zero_Locked(GIMBAL_ZERO_LOCK_YAW) == 0u)
+        // Pitch/Yaw外环都基于IMU姿态；这里只要求Yaw电机反馈ready后再闭环
+        yaw_feedback_ready = (Gimbal_Motor_Yaw.RxData.Encoder_Initialized != 0u);
+        if (yaw_feedback_ready == 0u)
         {
             can_online = CAN_Alive_IsOnline(&hcan2);
-            Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, can_output_map[can_online](0.0f));
-            Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, can_output_map[can_online](0.0f));
+            Gimbal_Send_Pitch_Yaw_CAN(can_output_map[can_online](0.0f),
+                                      can_output_map[can_online](0.0f));
             vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
             continue;
         }
-        
-       // 相位累加构造连续正弦目标，避免计数器抖动/溢出导致相位跳变
-        g_gimbal_yaw_test_phase += 2.0f * PI * GIMBAL_YAW_TEST_FREQ_HZ * GIMBAL_CTRL_DT;
-        if (g_gimbal_yaw_test_phase >= 2.0f * PI)
-        {
-            g_gimbal_yaw_test_phase -= 2.0f * PI;
-        }
+        now_tick = xTaskGetTickCount();
+        Gimbal_Sentry_Target_Update(now_tick);
+        pitch_target_deg = Gimbal_Sentry_Target_Get_Pitch();
+        yaw_target_deg = Gimbal_Sentry_Target_Get_Yaw();
+        //2) 计算控制输出
+        //pitch_target_deg = Gimbal_Yaw_Speed_Test_Sine_Target();
 
-        g_gimbal_pitch_test_phase += 2.0f * PI * GIMBAL_PITCH_TEST_FREQ_HZ * GIMBAL_CTRL_DT;
-        if (g_gimbal_pitch_test_phase >= 2.0f * PI)
-        {
-            g_gimbal_pitch_test_phase -= 2.0f * PI;
-        }
-        
-       
-        g_gimbal_yaw_target = Target_Yaw * sinf(g_gimbal_yaw_test_phase);
 
-        g_gimbal_pitch_target = Target_Pitch * sinf(g_gimbal_pitch_test_phase);
-        //pitch_target_speed = Gimbal_Generate_Flip_Step_Signal(time,1000,1.5);
-        // 6) 串级PID计算（测试模式：显式调用外环和内环）
-        pitch_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Pitch, g_gimbal_pitch_target, -Gimbal_Euler_Angle_to_send.pitch, GIMBAL_CTRL_DT);
-        // cnt ++;
-        // if(cnt %1000 == 0)
-        // {
-        //     pitch_target_speed = -pitch_target_speed;
-        // }
+        Gimbal_Update_Angle_Output_Shaping(&Gimbal_Motor_Pitch.PID[1],
+                                           pitch_target_deg - (-Gimbal_Euler_Angle_to_send.pitch),
+                                           &g_gimbal_pitch_track_shaper_config,
+                                           GIMBAL_SCAN_SHAPER_FILTER_TAU_S,
+                                           GIMBAL_PITCH_SCAN_SHAPER_SLEW_RATE);
+        pitch_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Pitch, pitch_target_deg, -Gimbal_Euler_Angle_to_send.pitch, GIMBAL_CTRL_DT);
         pitch_output = Motor_PID_Calculate_Speed(&Gimbal_Motor_Pitch, pitch_target_speed, Gimbal_Motor_Pitch.RxData.Speed, GIMBAL_CTRL_DT);
         
-        yaw_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Yaw, g_gimbal_yaw_target, Gimbal_Euler_Angle_to_send.yaw, GIMBAL_CTRL_DT);
+        Gimbal_Update_Angle_Output_Shaping(&Gimbal_Motor_Yaw.PID[1],
+                                           yaw_target_deg - Gimbal_Euler_Angle_to_send.yaw,
+                                           &g_gimbal_yaw_track_shaper_config,
+                                           GIMBAL_SCAN_SHAPER_FILTER_TAU_S,
+                                           GIMBAL_YAW_SCAN_SHAPER_SLEW_RATE);
+        yaw_target_speed = Motor_PID_Calculate_Angle(&Gimbal_Motor_Yaw, yaw_target_deg, Gimbal_Euler_Angle_to_send.yaw, GIMBAL_CTRL_DT);
         yaw_output = Motor_PID_Calculate_Speed(&Gimbal_Motor_Yaw, yaw_target_speed, Gimbal_Motor_Yaw.RxData.Speed, GIMBAL_CTRL_DT);
         
         //输出限幅
@@ -633,9 +523,10 @@ void Gimbal_Motor_Control_ALL_Test(void* params)
         yaw_output = Gimbal_Clamp(yaw_output, -GIMBAL_MOTOR_CMD_LIMIT, GIMBAL_MOTOR_CMD_LIMIT);
 
         can_online = CAN_Alive_IsOnline(&hcan2);
-        Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, can_output_map[can_online](pitch_output));
-        Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, can_output_map[can_online](yaw_output));
-
+        // Gimbal_Send_Pitch_Yaw_CAN(can_output_map[can_online](pitch_output),
+        //                         can_output_map[can_online](yaw_output));
+        //Motor_Send_CAN_Data(&Gimbal_Motor_Pitch, (int16_t)pitch_output);
+          Motor_Send_CAN_Data(&Gimbal_Motor_Yaw, (int16_t)yaw_output);
         vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
     }
 }
@@ -676,7 +567,7 @@ void Gimbal_Euler(void *pramas)
     (void)pramas;
 
     ALG_DWT_Timebase_Init(&g_gimbal_imu_timebase, GIMBAL_IMU_DT_DEFAULT_S);
-    Gimbal_Yaw_Continuous_Reset();
+    BMI088_Yaw_Continuous_Reset();
     
 #if GIMBAL_IMU_DRDY_ENABLE
     g_gimbal_imu_task_handle = xTaskGetCurrentTaskHandle();
@@ -708,7 +599,6 @@ void Gimbal_Euler(void *pramas)
         g_gimbal_imu_last_dt_from_dwt = g_gimbal_imu_timebase.last_dt_from_dwt;
         Gimbal_IMU_Data.dt = imu_dt;
         euler_raw = BMI088_Complementary_Filter(&Gimbal_IMU_Data, imu_dt, GIMBAL_MAHONY_KP, GIMBAL_MAHONY_KI);
-        euler_raw.yaw = Gimbal_Yaw_To_Continuous(euler_raw.yaw);
         Gimbal_Euler_Angle_to_send = euler_raw;
     }
 }
@@ -740,29 +630,13 @@ void Gimbal_Manifold_Control(void *pramas)
  * @param  pramas: 无
  * @retval 无
  */
-void Gimbal_Task(void* pramas)
+void Gimbal_Task(void *pramas)
 {
     TickType_t time;
-    uint16_t alive_check_div = 0;
+    uint16_t alive_check_div = 0u;
     uint8_t can_online_changed;
     uint8_t spi_online_changed;
     uint8_t usb_online_changed;
-   
-    static void (* const can_link_action[2])(void) =
-    {
-        Gimbal_CAN_Offline_Protect,
-        Gimbal_CAN_Online_Protect
-    };
-    static void (* const spi_link_action[2])(void) =
-    {
-        Gimbal_SPI_Offline_Protect,
-        Gimbal_SPI_Online_Protect
-    };
-    static void (* const usb_link_action[2])(void) =
-    {
-        Gimbal_USB_Offline_Protect,
-        Gimbal_USB_Online_Protect
-    };
 
     (void)pramas;
 
@@ -770,33 +644,30 @@ void Gimbal_Task(void* pramas)
 
     while (1)
     {
-        // 每100ms执行一次CAN/SPI/USB链路存活判断（Flag/Pre_Flag机制）
-        if (++alive_check_div >= 100)
+        // 每100ms执行一次 CAN / SPI / USB 存活判断
+        if (++alive_check_div >= 100u)
         {
-            alive_check_div = 0;
+            alive_check_div = 0u;
             CAN_Alive_Check_100ms(&hcan2);
             SPI_Alive_Check_100ms();
             USB_Alive_Check_100ms();
         }
 
-        // 若检测到CAN在线状态发生变化，在任务层执行对应保护动作
-        if (CAN_Alive_TryConsumeChanged(&hcan2, &can_online_changed) != 0)
+        if (CAN_Alive_TryConsumeChanged(&hcan2, &can_online_changed) != 0u)
         {
-            can_link_action[can_online_changed]();
+            Gimbal_Device_Check_Handle_CAN_Change(can_online_changed);
         }
 
-        // 若检测到SPI在线状态发生变化，在任务层执行对应保护动作
-        if (SPI_Alive_TryConsumeChanged(&spi_online_changed) != 0)
+        if (SPI_Alive_TryConsumeChanged(&spi_online_changed) != 0u)
         {
-            spi_link_action[spi_online_changed]();
+            Gimbal_Device_Check_Handle_SPI_Change(spi_online_changed);
         }
 
-        // 若检测到USB在线状态发生变化，在任务层执行对应保护动作
-        if (USB_Alive_TryConsumeChanged(&usb_online_changed) != 0)
+        if (USB_Alive_TryConsumeChanged(&usb_online_changed) != 0u)
         {
-            usb_link_action[usb_online_changed]();
+            Gimbal_Device_Check_Handle_USB_Change(usb_online_changed);
         }
-       
+
         vTaskDelayUntil(&time, GIMBAL_CTRL_PERIOD_TICK);
     }
 }

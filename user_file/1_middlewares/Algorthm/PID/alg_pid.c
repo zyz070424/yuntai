@@ -1,4 +1,76 @@
 ﻿#include "alg_pid.h"
+#define PID_OUTPUT_SLEW_RELEASE_GAIN 8.0f
+
+static float PID_Get_Friction_Compensation(const PID_TypeDef *pid)
+{
+    float omega;
+    float w_eps;
+
+    if (pid == NULL || pid->friction_comp_enable == false)
+    {
+        return 0.0f;
+    }
+
+    omega = pid->friction_use_target_omega ? pid->target : pid->Input;
+    w_eps = fabsf(pid->friction_w_eps);
+    if (w_eps < 1e-6f)
+    {
+        w_eps = 1e-6f;
+    }
+
+    return pid->friction_fc * tanhf(omega / w_eps) + pid->friction_bv * omega;
+}
+
+static PID_Output_Schedule_Mode_TypeDef PID_Select_Output_Schedule_Mode(
+    PID_Output_Schedule_Mode_TypeDef current_mode,
+    bool schedule_inited,
+    float abs_error,
+    const PID_Output_Schedule_Config_TypeDef *config)
+{
+    if (schedule_inited == false)
+    {
+        if (abs_error <= config->fine_enter_error)
+        {
+            return PID_OUTPUT_SCHEDULE_MODE_FINE;
+        }
+        if (abs_error <= config->medium_enter_error)
+        {
+            return PID_OUTPUT_SCHEDULE_MODE_MEDIUM;
+        }
+        return PID_OUTPUT_SCHEDULE_MODE_FAST;
+    }
+
+    switch (current_mode)
+    {
+        case PID_OUTPUT_SCHEDULE_MODE_FAST:
+            if (abs_error < config->medium_enter_error)
+            {
+                return PID_OUTPUT_SCHEDULE_MODE_MEDIUM;
+            }
+            break;
+
+        case PID_OUTPUT_SCHEDULE_MODE_MEDIUM:
+            if (abs_error > config->medium_exit_error)
+            {
+                return PID_OUTPUT_SCHEDULE_MODE_FAST;
+            }
+            if (abs_error < config->fine_enter_error)
+            {
+                return PID_OUTPUT_SCHEDULE_MODE_FINE;
+            }
+            break;
+
+        case PID_OUTPUT_SCHEDULE_MODE_FINE:
+        default:
+            if (abs_error > config->fine_exit_error)
+            {
+                return PID_OUTPUT_SCHEDULE_MODE_MEDIUM;
+            }
+            break;
+    }
+
+    return current_mode;
+}
 /**
  * @brief 初始化 PID 控制器
  * @param pid: PID 控制器指针
@@ -19,6 +91,7 @@ void PID_Init(PID_TypeDef *pid)
     pid->I_out = 0.0f;
     pid->D_out = 0.0f;
     pid->FeedForward_out = 0.0f;
+    pid->Friction_Compensation_out = 0.0f;
 
     pid->target = 0.0f;
     pid->prev_target = 0.0f;
@@ -48,10 +121,18 @@ void PID_Init(PID_TypeDef *pid)
     pid->deadband_enable = false;
     pid->deadband = 0.0f;
 
+    pid->friction_comp_enable = false;
+    pid->friction_fc = 0.0f;
+    pid->friction_bv = 0.0f;
+    pid->friction_w_eps = 1.0f;
+    pid->friction_use_target_omega = true;
+
     pid->output_filter_enable = false;
     pid->output_filter_tau_s = 0.0f;
     pid->output_slew_enable = false;
     pid->output_slew_rate = 0.0f;
+    pid->output_schedule_inited = false;
+    pid->output_schedule_mode = PID_OUTPUT_SCHEDULE_MODE_FAST;
     pid->output_shaper_inited = false;
     pid->output_shaper_state = 0.0f;
 
@@ -125,6 +206,34 @@ void PID_Deadband_Enable(PID_TypeDef *pid, bool enable, float deadband)
 }
 
 /**
+ * @brief 使能/禁用摩擦补偿（库仑摩擦 + 粘性摩擦）
+ * @param pid: PID 控制器指针
+ * @param enable: 是否使能
+ * @param Fc: 库仑摩擦补偿系数
+ * @param Bv: 粘性摩擦补偿系数
+ * @param w_eps: 平滑参数，避免tanh分母过小
+ * @param use_target_omega: true=使用目标值作为omega，false=使用输入值作为omega
+ * @note 推荐主要用于速度环/电流环，速度环通常优先使用目标速度作为omega
+ */
+void PID_Friction_Compensation_Enable(PID_TypeDef *pid, bool enable, float Fc, float Bv, float w_eps, bool use_target_omega)
+{
+    if (pid == NULL)
+    {
+        return;
+    }
+
+    pid->friction_comp_enable = enable;
+    pid->friction_fc = Fc;
+    pid->friction_bv = Bv;
+    pid->friction_w_eps = fabsf(w_eps);
+    if (pid->friction_w_eps < 1e-6f)
+    {
+        pid->friction_w_eps = 1e-6f;
+    }
+    pid->friction_use_target_omega = use_target_omega;
+}
+
+/**
  * @brief 使能/禁用PID输出低通整形
  * @param pid: PID 控制器指针
  * @param enable: 是否使能
@@ -145,7 +254,8 @@ void PID_Output_Filter_Enable(PID_TypeDef *pid, bool enable, float tau_s)
  * @brief 使能/禁用PID输出斜率限制
  * @param pid: PID 控制器指针
  * @param enable: 是否使能
- * @param slew_rate: 最大变化率（单位/秒）
+ * @param slew_rate: 输出增大时的最大变化率（单位/秒）
+ * @note 输出回收/反向时会自动使用更快的释放速率，减少换向时的相位滞后
  */
 void PID_Output_Slew_Enable(PID_TypeDef *pid, bool enable, float slew_rate)
 {
@@ -156,6 +266,66 @@ void PID_Output_Slew_Enable(PID_TypeDef *pid, bool enable, float slew_rate)
 
     pid->output_slew_enable = enable;
     pid->output_slew_rate = fabsf(slew_rate);
+}
+
+/**
+ * @brief 复位 PID 输出调度状态
+ * @param pid: PID 控制器指针
+ * @param mode: 复位后的默认档位
+ * @retval 无
+ * @note  该接口不会重置 output_shaper_state，避免模式切换时引入额外跳变
+ */
+void PID_Output_Schedule_Reset(PID_TypeDef *pid, PID_Output_Schedule_Mode_TypeDef mode)
+{
+    if (pid == NULL)
+    {
+        return;
+    }
+
+    pid->output_schedule_inited = false;
+    pid->output_schedule_mode = mode;
+}
+
+/**
+ * @brief 按误差大小应用 PID 输出整形调度
+ * @param pid: PID 控制器指针
+ * @param abs_error: 当前误差绝对值
+ * @param config: 输出整形调度配置
+ * @retval 无
+ * @note  调度器只修改输出低通与斜率限制参数，适合在每个控制周期调用一次
+ */
+void PID_Output_Schedule_Apply(PID_TypeDef *pid, float abs_error, const PID_Output_Schedule_Config_TypeDef *config)
+{
+    if ((pid == NULL) || (config == NULL))
+    {
+        return;
+    }
+
+    abs_error = fabsf(abs_error);
+    pid->output_schedule_mode = PID_Select_Output_Schedule_Mode(pid->output_schedule_mode,
+                                                                pid->output_schedule_inited,
+                                                                abs_error,
+                                                                config);
+    pid->output_schedule_inited = true;
+
+    switch (pid->output_schedule_mode)
+    {
+        case PID_OUTPUT_SCHEDULE_MODE_FAST:
+            PID_Output_Filter_Enable(pid, config->fast_filter_tau_s > 0.0f, config->fast_filter_tau_s);
+            PID_Output_Slew_Enable(pid, config->fast_slew_rate > 0.0f, config->fast_slew_rate);
+            break;
+
+        case PID_OUTPUT_SCHEDULE_MODE_MEDIUM:
+            PID_Output_Filter_Enable(pid, config->medium_filter_tau_s > 0.0f, config->medium_filter_tau_s);
+            PID_Output_Slew_Enable(pid, config->medium_slew_rate > 0.0f, config->medium_slew_rate);
+            break;
+
+        case PID_OUTPUT_SCHEDULE_MODE_FINE:
+        default:
+            PID_Output_Filter_Enable(pid, config->fine_filter_tau_s > 0.0f, config->fine_filter_tau_s);
+            PID_Output_Slew_Enable(pid, config->fine_slew_rate > 0.0f, config->fine_slew_rate);
+            break;
+    }
 }
 
 /**
@@ -222,6 +392,7 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
     float alpha;
     float delta;
     float delta_max;
+    float output_no_friction_comp;
     // 检查 PID 控制器指针是否为空
     if (pid == NULL)
     {
@@ -232,7 +403,7 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
     {
         dt = dt_min;
     }
-    
+
     pid->dt = dt;
     pid->Input = Input;
     pid->target = Target;
@@ -258,6 +429,7 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
         pid->I_out = 0.0f;
         pid->D_out = 0.0f;
         pid->FeedForward_out = 0.0f;
+        pid->Friction_Compensation_out = 0.0f;
         pid->output_shaper_state = 0.0f;
         pid->output_shaper_inited = true;
         pid->prev_error = pid->error;
@@ -297,7 +469,7 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
         pid->D_out = pid->Kd * ((pid->error - pid->prev_error) / pid->dt);
     }
     // 计算前馈项输出
-    pid->FeedForward_out = pid->FeedForward * pid->target;
+    pid->FeedForward_out = pid->FeedForward * ((pid->target - pid->prev_target)/pid->dt);
 
     // 先计算“候选积分”，再做抗饱和判定，避免积分在饱和边缘持续累加
     integral_candidate = pid->integral + pid->error * pid->dt * integral_coef;
@@ -310,7 +482,9 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
         integral_candidate = pid->integral_max;
     }
 
-    output_unsat_candidate = pid->P_out + pid->Ki * integral_candidate + pid->D_out + pid->FeedForward_out;
+    output_no_friction_comp = pid->P_out + pid->Ki * integral_candidate + pid->D_out + pid->FeedForward_out;
+    pid->Friction_Compensation_out = PID_Get_Friction_Compensation(pid);
+    output_unsat_candidate = output_no_friction_comp + pid->Friction_Compensation_out;
     if (((output_unsat_candidate > pid->out_max) && (pid->error > 0.0f)) ||
         ((output_unsat_candidate < pid->out_min) && (pid->error < 0.0f)))
     {
@@ -323,7 +497,7 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
 
     pid->I_out = pid->Ki * pid->integral;
     // 计算未限幅输出
-    output_unsat = pid->P_out + pid->I_out + pid->D_out + pid->FeedForward_out;
+    output_unsat = pid->P_out + pid->I_out + pid->D_out + pid->FeedForward_out + pid->Friction_Compensation_out;
     output_limited = output_unsat;
 
     // 检查输出是否超出限幅范围，若超出则进行限幅
@@ -365,6 +539,11 @@ float PID_Calculate(PID_TypeDef *pid, float Input, float Target, float dt)
         {
             delta = output_shaped - pid->output_shaper_state;
             delta_max = pid->output_slew_rate * pid->dt;
+            if ((output_shaped * pid->output_shaper_state < 0.0f) ||
+                (fabsf(output_shaped) < fabsf(pid->output_shaper_state)))
+            {
+                delta_max *= PID_OUTPUT_SLEW_RELEASE_GAIN;
+            }
             if (delta > delta_max)
             {
                 delta = delta_max;

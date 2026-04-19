@@ -11,6 +11,7 @@ HAL_StatusTypeDef BMI088_Init(SPI_HandleTypeDef *hspi);
 void BMI088_ReadAccel(SPI_HandleTypeDef *hspi, imu_data_t *data);
 void BMI088_ReadGyro(SPI_HandleTypeDef *hspi, imu_data_t *data);
 void BMI088_ReadTemp(SPI_HandleTypeDef *hspi, imu_data_t *data);
+void BMI088_Yaw_Continuous_Reset(void);
 euler_t BMI088_Complementary_Filter(imu_data_t *data, float dt, float kp, float ki);
 
 //数据处理

@@ -4,6 +4,70 @@
 
 #define BMI088_OK_OR_RETURN(x) do { if ((x) != HAL_OK) return HAL_ERROR; } while (0)
 static quat_t g_bmi088_quat = {1.0f, 0.0f, 0.0f, 0.0f};
+static uint8_t g_bmi088_yaw_continuous_inited = 0u;
+static float g_bmi088_yaw_zero_raw_deg = 0.0f;
+static float g_bmi088_yaw_last_rel_wrapped_deg = 0.0f;
+static float g_bmi088_yaw_continuous_deg = 0.0f;
+
+static float BMI088_Wrap180(float angle_deg)
+{
+    while (angle_deg >= 180.0f)
+    {
+        angle_deg -= 360.0f;
+    }
+
+    while (angle_deg < -180.0f)
+    {
+        angle_deg += 360.0f;
+    }
+
+    return angle_deg;
+}
+
+static float BMI088_Yaw_To_Continuous(float raw_yaw_deg)
+{
+    float yaw_rel_wrapped_deg;
+    float dyaw_deg;
+
+    if (isfinite(raw_yaw_deg) == 0)
+    {
+        return g_bmi088_yaw_continuous_deg;
+    }
+
+    if (g_bmi088_yaw_continuous_inited == 0u)
+    {
+        g_bmi088_yaw_zero_raw_deg = raw_yaw_deg;
+        g_bmi088_yaw_last_rel_wrapped_deg = 0.0f;
+        g_bmi088_yaw_continuous_deg = 0.0f;
+        g_bmi088_yaw_continuous_inited = 1u;
+        return 0.0f;
+    }
+
+    yaw_rel_wrapped_deg = BMI088_Wrap180(raw_yaw_deg - g_bmi088_yaw_zero_raw_deg);
+    dyaw_deg = yaw_rel_wrapped_deg - g_bmi088_yaw_last_rel_wrapped_deg;
+
+    if (dyaw_deg > 180.0f)
+    {
+        dyaw_deg -= 360.0f;
+    }
+    else if (dyaw_deg < -180.0f)
+    {
+        dyaw_deg += 360.0f;
+    }
+
+    g_bmi088_yaw_continuous_deg += dyaw_deg;
+    g_bmi088_yaw_last_rel_wrapped_deg = yaw_rel_wrapped_deg;
+
+    return g_bmi088_yaw_continuous_deg;
+}
+
+void BMI088_Yaw_Continuous_Reset(void)
+{
+    g_bmi088_yaw_continuous_inited = 0u;
+    g_bmi088_yaw_zero_raw_deg = 0.0f;
+    g_bmi088_yaw_last_rel_wrapped_deg = 0.0f;
+    g_bmi088_yaw_continuous_deg = 0.0f;
+}
 
 /**
  * @brief 传感器坐标系 -> 云台机体系固定映射
@@ -50,6 +114,7 @@ HAL_StatusTypeDef BMI088_Init(SPI_HandleTypeDef *hspi)
     g_bmi088_quat.x = 0.0f;
     g_bmi088_quat.y = 0.0f;
     g_bmi088_quat.z = 0.0f;
+    BMI088_Yaw_Continuous_Reset();
 
     SPI_DMA_Init();
 
@@ -199,6 +264,7 @@ euler_t BMI088_Complementary_Filter(imu_data_t *data, float dt, float kp, float 
 
     mahony_update(&g_bmi088_quat, imu, kp, ki);
     euler = quat_to_euler(g_bmi088_quat);
+    euler.yaw = BMI088_Yaw_To_Continuous(euler.yaw);
 
     return euler;
 }

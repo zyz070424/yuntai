@@ -56,9 +56,12 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     user_file/1_middlewares/Algorthm/Quaternion/alg_quaternion.c
     user_file/2_Device/BMI088/dvc_bmi088.c
     user_file/2_Device/Motor/dvc_motor.c
+    user_file/2_Device/Motor/dvc_motor_protect.c
     user_file/2_Device/VOFA/dvc_vofa.c
     user_file/2_Device/DR16/dvc_dr16.c
     user_file/2_Device/Manifold/dvc_manifold.c
+    user_file/3_Module/Gimbal/gimbal_sentry.c
+    user_file/3_Module/Gimbal/gimbal_sentry_target.c
     user_file/3_Module/Gimbal/Gimbal.c
     user_file/4_Task/MyTask.c
 )

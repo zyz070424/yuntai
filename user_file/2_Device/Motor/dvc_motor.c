@@ -72,13 +72,70 @@ static uint8_t *Motor_Get_Tx_Frame_Buffer(CAN_HandleTypeDef *can, uint32_t send_
 }
 
 /**
- * @brief 更新控制帧中某个电机槽位并发送，可以有效防止频繁更新tx缓存
+ * @brief 获取某个电机对应的发送帧ID和槽位索引
+ * @param motor 电机对象
+ * @param send_id 输出控制帧ID
+ * @param byte_index 输出当前电机对应的高字节索引（0/2/4/6）
+ * @retval 1=成功 0=失败
+ */
+static uint8_t Motor_Get_Send_Frame_Info(Motor_TypeDef *motor, uint32_t *send_id, uint8_t *byte_index)
+{
+    if (motor == NULL || motor->can == NULL || send_id == NULL || byte_index == NULL)
+    {
+        return 0u;
+    }
+
+    if (motor->ID < 1u || motor->ID > 7u)
+    {
+        return 0u;
+    }
+
+    if (motor->ID <= 4u)
+    {
+        *byte_index = (uint8_t)((motor->ID - 1u) * 2u);
+
+        switch (motor->type)
+        {
+            case M3508:
+                *send_id = 0x200;
+                return 1u;
+            case GM6020_Voltage:
+                *send_id = 0x1FF;
+                return 1u;
+            case GM6020_Current:
+                *send_id = 0x1FE;
+                return 1u;
+            default:
+                return 0u;
+        }
+    }
+
+    *byte_index = (uint8_t)((motor->ID - 5u) * 2u);
+
+    switch (motor->type)
+    {
+        case M3508:
+            *send_id = 0x1FF;
+            return 1u;
+        case GM6020_Voltage:
+            *send_id = 0x2FF;
+            return 1u;
+        case GM6020_Current:
+            *send_id = 0x2FE;
+            return 1u;
+        default:
+            return 0u;
+    }
+}
+
+/**
+ * @brief 更新控制帧中某个电机槽位，不立即发送
  * @param motor 电机对象
  * @param send_id 控制帧ID
  * @param byte_index 当前电机对应的高字节索引（0/2/4/6）
  * @param data 电机控制量
  */
-static void Motor_Update_Frame_And_Send(Motor_TypeDef *motor, uint32_t send_id, uint8_t byte_index, int16_t data)
+static void Motor_Update_Frame_Data(Motor_TypeDef *motor, uint32_t send_id, uint8_t byte_index, int16_t data)
 {
     uint8_t *tx_data;
 
@@ -87,7 +144,7 @@ static void Motor_Update_Frame_And_Send(Motor_TypeDef *motor, uint32_t send_id, 
         return;
     }
 
-    if (byte_index > 6)
+    if (byte_index > 6u)
     {
         return;
     }
@@ -101,8 +158,47 @@ static void Motor_Update_Frame_And_Send(Motor_TypeDef *motor, uint32_t send_id, 
     // 只更新当前电机在控制帧中的两个字节，其它电机字节保持上次值
     tx_data[byte_index] = (uint8_t)(data >> 8);
     tx_data[byte_index + 1] = (uint8_t)data;
+}
 
-    CAN_Send(motor->can, send_id, tx_data);
+/**
+ * @brief 按帧ID发送当前缓存中的8字节控制帧
+ * @param can CAN句柄
+ * @param send_id 控制帧ID
+ */
+static void Motor_Send_Frame_By_Id(CAN_HandleTypeDef *can, uint32_t send_id)
+{
+    uint8_t *tx_data;
+
+    if (can == NULL)
+    {
+        return;
+    }
+
+    tx_data = Motor_Get_Tx_Frame_Buffer(can, send_id);
+    if (tx_data == NULL)
+    {
+        return;
+    }
+
+    CAN_Send(can, send_id, tx_data);
+}
+
+/**
+ * @brief 更新控制帧中某个电机槽位并立即发送
+ * @param motor 电机对象
+ * @param send_id 控制帧ID
+ * @param byte_index 当前电机对应的高字节索引（0/2/4/6）
+ * @param data 电机控制量
+ */
+static void Motor_Update_Frame_And_Send(Motor_TypeDef *motor, uint32_t send_id, uint8_t byte_index, int16_t data)
+{
+    if (motor == NULL || motor->can == NULL)
+    {
+        return;
+    }
+
+    Motor_Update_Frame_Data(motor, send_id, byte_index, data);
+    Motor_Send_Frame_By_Id(motor->can, send_id);
 }
 
 /**
@@ -178,6 +274,32 @@ void Motor_Set_PID_Params(Motor_TypeDef *motor, uint8_t pid_index,
     }
 
     PID_Set_Parameters(&motor->PID[pid_index], p, i, d, feedforward, integral_min, integral_max, out_min, out_max);
+}
+
+/**
+ * @brief 清空电机当前控制运行态，不改PID参数
+ * @param motor 电机结构体指针
+ */
+void Motor_Clear_Runtime(Motor_TypeDef *motor)
+{
+    uint8_t i;
+
+    if (motor == NULL)
+    {
+        return;
+    }
+
+    for (i = 0; i < motor->PID_Use_Count && i < 2u; i++)
+    {
+        motor->PID[i].integral = 0.0f;
+        motor->PID[i].error = 0.0f;
+        motor->PID[i].prev_error = 0.0f;
+        motor->PID[i].target = 0.0f;
+        motor->PID[i].prev_target = 0.0f;
+        motor->PID[i].output = 0.0f;
+        motor->PID[i].output_shaper_state = 0.0f;
+        motor->PID[i].output_shaper_inited = 1u;
+    }
 }
 
 
@@ -407,7 +529,52 @@ void Motor_CAN_Data_Receive(Motor_TypeDef *motor)
                 return;
         }
     }
-    
+}
+
+/**
+ * @brief 获取电机对应的控制帧发送ID
+ * @param motor 电机对象
+ * @retval 控制帧ID，失败返回0
+ */
+uint32_t Motor_Get_CAN_Send_Id(Motor_TypeDef *motor)
+{
+    uint32_t send_id;
+    uint8_t byte_index;
+
+    if (Motor_Get_Send_Frame_Info(motor, &send_id, &byte_index) == 0u)
+    {
+        return 0u;
+    }
+
+    return send_id;
+}
+
+/**
+ * @brief 仅更新当前电机对应的CAN发送缓存，不立即发送
+ * @param motor 电机对象
+ * @param data 要写入缓存的16位控制量
+ */
+void Motor_Update_CAN_Cache(Motor_TypeDef *motor, int16_t data)
+{
+    uint32_t send_id;
+    uint8_t byte_index;
+
+    if (Motor_Get_Send_Frame_Info(motor, &send_id, &byte_index) == 0u)
+    {
+        return;
+    }
+
+    Motor_Update_Frame_Data(motor, send_id, byte_index, data);
+}
+
+/**
+ * @brief 按控制帧ID发送对应缓存
+ * @param can CAN句柄
+ * @param send_id 控制帧ID
+ */
+void Motor_Send_CAN_Frame_By_Id(CAN_HandleTypeDef *can, uint32_t send_id)
+{
+    Motor_Send_Frame_By_Id(can, send_id);
 }
 
 /**
@@ -417,106 +584,13 @@ void Motor_CAN_Data_Receive(Motor_TypeDef *motor)
  */
 void Motor_Send_CAN_Data(Motor_TypeDef *motor, int16_t data)
 {
-    if (motor == NULL || motor->can == NULL)
+    uint32_t send_id;
+    uint8_t byte_index;
+
+    if (Motor_Get_Send_Frame_Info(motor, &send_id, &byte_index) == 0u)
     {
         return;
     }
 
-    if (motor->ID < 1 || motor->ID > 7)
-    {
-        return;
-    }
-
-    switch (motor->type)
-    {
-        case M3508:
-            switch (motor->ID)
-            {
-                case 1:
-                    Motor_Update_Frame_And_Send(motor, 0x200, 0, data);
-                    break;
-                case 2:
-                    Motor_Update_Frame_And_Send(motor, 0x200, 2, data);
-                    break;
-                case 3:
-                    Motor_Update_Frame_And_Send(motor, 0x200, 4, data);
-                    break;
-                case 4:
-                    Motor_Update_Frame_And_Send(motor, 0x200, 6, data);
-                    break;
-                case 5:
-                    Motor_Update_Frame_And_Send(motor, 0x1FF, 0, data);
-                    break;
-                case 6:
-                    Motor_Update_Frame_And_Send(motor, 0x1FF, 2, data);
-                    break;
-                case 7:
-                    Motor_Update_Frame_And_Send(motor, 0x1FF, 4, data);
-                    break; 
-                default:
-                    break;
-            }
-            break;
-
-        case GM6020_Voltage:
-            switch (motor->ID)
-            {
-                case 1:
-                    Motor_Update_Frame_And_Send(motor, 0x1FF, 0, data);
-                    break;
-                case 2:
-                    Motor_Update_Frame_And_Send(motor, 0x1FF, 2, data);
-                    break;
-                case 3:
-                    Motor_Update_Frame_And_Send(motor, 0x1FF, 4, data);
-                    break;
-                case 4:
-                    Motor_Update_Frame_And_Send(motor, 0x1FF, 6, data);
-                    break;
-                case 5:
-                    Motor_Update_Frame_And_Send(motor, 0x2FF, 0, data);
-                    break;
-                case 6:
-                    Motor_Update_Frame_And_Send(motor, 0x2FF, 2, data);
-                    break;
-                case 7:
-                    Motor_Update_Frame_And_Send(motor, 0x2FF, 4, data);
-                    break;
-                default:
-                    break;
-            }
-            break;
-
-        case GM6020_Current:
-            switch (motor->ID)
-            {
-                case 1:
-                    Motor_Update_Frame_And_Send(motor, 0x1FE, 0, data);
-                    break;
-                case 2:
-                    Motor_Update_Frame_And_Send(motor, 0x1FE, 2, data);
-                    break;
-                case 3:
-                    Motor_Update_Frame_And_Send(motor, 0x1FE, 4, data);
-                    break;
-                case 4:
-                    Motor_Update_Frame_And_Send(motor, 0x1FE, 6, data);
-                    break;
-                case 5:
-                    Motor_Update_Frame_And_Send(motor, 0x2FE, 0, data);
-                    break;
-                case 6:
-                    Motor_Update_Frame_And_Send(motor, 0x2FE, 2, data);
-                    break;
-                case 7:
-                    Motor_Update_Frame_And_Send(motor, 0x2FE, 4, data);
-                    break;
-                default:
-                    break;
-            }
-            break;
-
-        default:
-            break;
-    }
+    Motor_Update_Frame_And_Send(motor, send_id, byte_index, data);
 }

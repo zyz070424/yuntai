@@ -1,0 +1,981 @@
+视觉扫描与堵转回退使用手册
+========================================
+
+版本说明
+----------------------------------------
+本文档对应当前工作区代码状态编写，面向本工程 yuntai。
+
+当前进度分两部分：
+
+1. 视觉扫描 + 识别后跟随装甲板
+   这一部分已经接入现有 Gimbal 控制任务，代码已经存在。
+
+2. 电机堵转回退
+   这一部分目前已经完成独立保护模块初稿，但还没有正式接到 Gimbal 主控制链。
+   也就是说：
+   - 模块接口和状态机已经写好
+   - 但 pitch 轴是否启用、何时触发回退、回退方向怎么给，还需要接到 Gimbal.c
+
+因此，本文档里会明确区分：
+   - 已可直接使用的功能
+   - 已有模块、但还需要接线的功能
+
+
+一、功能总览
+----------------------------------------
+
+本工程现在要实现的两类能力如下：
+
+1. 视觉扫描与识别后跟随
+   在没有目标时，云台按预设扫描轨迹上下左右搜索。
+   当视觉识别到装甲板时，云台切换到跟踪状态，直接跟随视觉给出的目标角运动。
+   如果目标丢失，则先回到原扫描轨迹，再继续搜索。
+
+2. 电机堵转回退
+   当某个轴在运动过程中出现“明显在用力，但速度很小，误差又很大”的情况时，
+   判定为堵转或接近堵转。
+   对于有机械限位的轴，可以触发小幅回退保护，避免继续死顶电机。
+   对于没有机械限位的轴，不建议用“撞限位再回退”的方式工作，而应进入停机或故障保护。
+
+
+二、工程中相关文件
+----------------------------------------
+
+1. 视觉协议与接收
+   user_file/2_Device/Manifold/dvc_manifold.h
+   user_file/2_Device/Manifold/dvc_manifold.c
+
+2. 云台控制主逻辑
+   user_file/3_Module/Gimbal/Gimbal.h
+   user_file/3_Module/Gimbal/Gimbal.c
+
+3. 云台哨兵扫描/跟随模式层
+   user_file/3_Module/Gimbal/gimbal_sentry.h
+   user_file/3_Module/Gimbal/gimbal_sentry.c
+
+4. 电机基础驱动
+   user_file/2_Device/Motor/dvc_motor.h
+   user_file/2_Device/Motor/dvc_motor.c
+
+5. 电机堵转保护模块初稿
+   user_file/2_Device/Motor/dvc_motor_protect.h
+   user_file/2_Device/Motor/dvc_motor_protect.c
+
+6. 任务入口
+   user_file/4_Task/MyTask.c
+
+7. 构建入口
+   CMakeLists.txt
+
+
+三、任务与控制链总体结构
+----------------------------------------
+
+当前任务启动顺序由 user_file/4_Task/MyTask.c 负责，核心任务如下：
+
+1. Gimbal_Motor_Control_ALL_Test
+   云台双轴主控制任务，1ms 周期。
+   虽然函数名里还有 Test，但当前已经不再是纯正弦测试，而是接入了视觉状态机。
+
+2. Gimbal_Euler
+   1ms 周期读取 BMI088，并计算当前 Pitch/Yaw 欧拉角。
+
+3. Gimbal_Task
+   负责 CAN、SPI、USB 的在线状态检测和链路保护动作。
+
+4. Gimbal_Manifold_Control
+   负责把当前云台 Pitch/Yaw 通过 USB 发送给视觉端或上位机。
+
+整体数据流如下：
+
+视觉发目标角
+  -> USB 接收回调解包
+  -> Rx_Data.Taget_Pitch / Rx_Data.Taget_Yaw 更新
+  -> Gimbal 控制状态机判定当前处于 SCAN / TRACK / LOST_RETURN
+  -> 生成 g_gimbal_pitch_target / g_gimbal_yaw_target
+  -> 外环 PID 计算目标速度
+  -> 内环 PID 计算电机控制输出
+  -> CAN 发给 GM6020
+
+
+四、第一部分：上下左右扫描，识别后跟随装甲板
+----------------------------------------
+
+4.1 功能目标
+----------------------------------------
+
+这部分功能的目标是：
+
+1. 没有目标时，云台自动扫描搜索目标
+2. 一旦视觉识别到装甲板，云台立即转入跟随
+3. 如果目标丢失，云台不要突然乱跳，而是先回到扫描轨迹，再继续搜索
+
+这正是当前 gimbal_sentry.c 已经接入的三态状态机：
+
+1. SCAN
+2. TRACK_ARMOR
+3. LOST_TARGET_RETURN_SCAN
+
+
+4.2 当前代码里的状态机说明
+----------------------------------------
+
+状态机定义在：
+   user_file/3_Module/Gimbal/gimbal_sentry.h
+   user_file/3_Module/Gimbal/gimbal_sentry.c
+
+Gimbal.c 现在只做适配：
+   - 判断视觉目标帧是否新鲜
+   - 把 Rx_Data.Taget_Pitch / Rx_Data.Taget_Yaw 传给 gimbal_sentry
+   - 接收 gimbal_sentry 输出的 pitch/yaw 目标角
+   - 再进入原来的角度环 + 速度环 PID
+
+状态枚举：
+   GIMBAL_CTRL_STATE_SCAN
+   GIMBAL_CTRL_STATE_TRACK_ARMOR
+   GIMBAL_CTRL_STATE_LOST_TARGET_RETURN_SCAN
+
+状态机结构体大致包含：
+   - 当前状态
+   - yaw 扫描方向
+   - pitch 扫描方向
+   - 当前扫描轨迹的 yaw 目标
+   - 当前扫描轨迹的 pitch 目标
+   - 丢目标时要返回的扫描轨迹目标
+   - 最近一次接收到的视觉帧序号
+   - 最近一次接收到新鲜视觉帧的时间戳
+
+
+4.3 三个状态分别做什么
+----------------------------------------
+
+一、SCAN
+
+含义：
+   云台在没有视觉目标时，按软件设定的扫描轨迹来回巡航。
+
+行为：
+   - yaw 在扫描软限位之间来回扫描
+   - pitch 也在扫描软限位之间来回扫描
+   - 每一拍都更新扫描目标
+   - 如果收到新鲜视觉目标帧，则切换到 TRACK_ARMOR
+
+适合用途：
+   - 哨兵模式搜索目标
+   - 没有识别到目标时的默认巡逻
+
+
+二、TRACK_ARMOR
+
+含义：
+   视觉端已经给出目标角，云台开始跟随装甲板运动。
+
+行为：
+   - 直接使用 Rx_Data.Taget_Pitch 作为 pitch 目标
+   - 直接使用 Rx_Data.Taget_Yaw 作为 yaw 目标
+   - 目标角会先做机械范围夹紧
+   - 只要视觉持续给新鲜目标帧，就持续跟随
+   - 如果视觉目标超时，则切换到 LOST_TARGET_RETURN_SCAN
+
+适合用途：
+   - 已识别到装甲板，进入目标跟随
+
+
+三、LOST_TARGET_RETURN_SCAN
+
+含义：
+   刚刚还在跟踪目标，但目标已经丢失。
+
+行为：
+   - 当前不会立刻跳回 SCAN
+   - 而是先缓慢回到当前扫描轨迹上应该在的位置
+   - 回到扫描轨迹后，重新切到 SCAN
+   - 如果在返回过程中视觉重新给出了新鲜目标帧，则立即切回 TRACK_ARMOR
+
+这样做的优点：
+   - 丢目标后动作更平滑
+   - 不会瞬间从跟踪目标跳到另一个完全不相关的扫描点
+   - 巡航轨迹更连续
+
+
+4.4 视觉协议格式
+----------------------------------------
+
+当前视觉协议是固定长度二进制格式：
+
+接收帧格式：
+   [Header][Yaw(float)][Pitch(float)][Tail]
+
+发送帧格式：
+   [Header][Yaw(float)][Pitch(float)][Tail]
+
+说明：
+   - Header 为 1 字节
+   - Pitch 为 4 字节 float
+   - Yaw 为 4 字节 float
+   - Tail 为 1 字节
+
+当前代码默认：
+   Header = 0xFE
+   Tail   = 0xFF
+
+初始化位置在：
+   Gimbal_Init()
+   Manifold_Init(&Tx_Data, 0xFE, 0xFF, Manifold_Sentry_Mode_ENABLE);
+
+
+4.5 视觉目标角的语义
+----------------------------------------
+
+当前代码默认视觉发来的 Pitch/Yaw 是“绝对目标角”。
+
+也就是说，控制板认为：
+   Rx_Data.Taget_Pitch = 云台应该到达的绝对俯仰角
+   Rx_Data.Taget_Yaw   = 云台应该到达的绝对偏航角
+
+不是：
+   当前角度基础上的偏差量
+
+如果你的视觉算法输出的是“偏差量”而不是“绝对角”，那就不能直接用当前这版代码。
+需要把 TRACK_ARMOR 状态改成：
+
+   pitch_target = 当前 pitch + 视觉偏差 pitch
+   yaw_target   = 当前 yaw   + 视觉偏差 yaw
+
+如果不改，会出现以下问题：
+   - 云台跳到奇怪位置
+   - 跟踪方向不符合预期
+   - pitch / yaw 可能在夹紧后始终达不到视觉预期
+
+
+4.6 视觉新鲜度判定机制
+----------------------------------------
+
+当前协议里没有 target_valid、confidence、shoot_flag 这些字段。
+因此当前工程采用的策略是：
+
+1. 每收到一帧合法视觉数据，就把 Manifold_USB_Rx_Frame_Seq 加 1
+2. Gimbal 控制层记录最近一次看到“新序号”的时间
+3. 如果超过设定时间没有看到新帧，就认为目标失效
+
+当前默认超时时间：
+   GIMBAL_VISION_TRACK_TIMEOUT_MS = 120 ms
+
+这意味着：
+
+1. 如果视觉持续正常输出目标帧
+   则状态机会保持在 TRACK_ARMOR
+
+2. 如果视觉停止输出
+   则 120ms 后会退出 TRACK_ARMOR
+
+3. 如果视觉还在线，但一直重复发送旧值
+   当前代码仍然会认为“有新鲜目标”
+   因为当前只看有没有新帧，不看目标内容是否变化
+
+如果后续你希望判定更稳，建议升级协议，加：
+   - target_valid
+   - confidence
+   - armor_id
+   - target_lost
+
+
+4.7 当前扫描参数说明
+----------------------------------------
+
+当前扫描参数仍在 Gimbal.c 中统一配置，然后传给 gimbal_sentry：
+
+1. Yaw 扫描软限位
+   GIMBAL_SCAN_YAW_MIN_ANGLE
+   GIMBAL_SCAN_YAW_MAX_ANGLE
+
+2. Pitch 扫描软限位
+   GIMBAL_SCAN_PITCH_MIN_ANGLE
+   GIMBAL_SCAN_PITCH_MAX_ANGLE
+
+3. 扫描速度
+   GIMBAL_SCAN_YAW_SPEED_DEG_S
+   GIMBAL_SCAN_PITCH_SPEED_DEG_S
+
+4. 丢目标返回速度
+   GIMBAL_LOST_RETURN_SPEED_DEG_S
+
+5. 返回扫描轨迹的判定阈值
+   GIMBAL_LOST_RETURN_NEAR_DEG
+
+这些参数的含义如下：
+
+一、扫描软限位
+   这是扫描过程中允许到达的软件角度边界。
+   它应该设置在真实机械限位以内，避免扫描动作撞到机械结构。
+
+二、扫描速度
+   决定状态机每拍推进扫描轨迹的速度。
+   数值越大，扫描越快，但对电机和 PID 的要求更高。
+
+三、丢目标返回速度
+   决定从 TRACK_ARMOR 退出后，云台回到扫描轨迹的速度。
+   数值太大则动作突兀，太小则回扫显得拖沓。
+
+四、返回判定阈值
+   当当前目标与扫描轨迹目标差值小于该阈值时，认为已经回到扫描轨迹。
+
+
+4.8 如何实际使用“扫描并跟随”
+----------------------------------------
+
+步骤 1：上电初始化
+   Task_Init() 会调用 Gimbal_Init()
+   Gimbal_Init() 会初始化 USB、CAN、IMU、电机 PID、视觉收发
+
+步骤 2：确保视觉端按当前协议发送目标角
+   必须发送 [Header][Pitch][Yaw][Tail]
+   Header/Tail 必须和控制板一致
+
+步骤 3：云台进入 SCAN
+   刚上电时，状态机会重置到 SCAN
+   此时 pitch/yaw 会在扫描范围内来回巡航
+
+步骤 4：视觉识别到装甲板
+   视觉开始持续发送新的 Taget_Pitch / Taget_Yaw
+   控制板检测到新鲜目标帧后，切到 TRACK_ARMOR
+
+步骤 5：云台跟随装甲板
+   目标角直接进入双环 PID
+   外环计算目标速度，内环输出电机控制量
+
+步骤 6：目标丢失
+   如果超过 120ms 没有新鲜视觉目标帧
+   状态机会切到 LOST_TARGET_RETURN_SCAN
+
+步骤 7：回到扫描轨迹
+   云台先回到当前扫描轨迹应在的位置，再切回 SCAN
+
+
+4.9 当前方案的边界和注意事项
+----------------------------------------
+
+1. 当前没有 target_valid 位
+   目标是否存在完全依赖“最近是否收到新鲜帧”
+
+2. 当前没有 confidence
+   不能根据置信度筛掉抖动目标或误识别目标
+
+3. 当前没有 armor_id
+   当视觉在不同装甲板之间切换时，控制板无法区分“还是同一个目标”还是“已经换目标”
+
+4. 当前没有速度前馈
+   如果目标快速横移，可能会有一定跟踪滞后
+
+5. 当前仍然是双轴级联 PID
+   跟踪效果仍然依赖 PID 参数是否合适
+
+6. yaw 和 pitch 的反馈正方向并不完全相同
+   当前 pitch 反馈使用的是 -Gimbal_Euler_Angle_to_send.pitch
+   yaw 使用的是 Gimbal_Euler_Angle_to_send.yaw
+   所以后续扩展时，方向符号必须继续按轴处理，不能简单复制粘贴
+
+
+4.10 推荐调试顺序
+----------------------------------------
+
+建议按下面顺序调：
+
+第一步：先不接视觉，只看 SCAN
+   目标：
+   - pitch/yaw 扫描方向正确
+   - 软限位生效
+   - 扫描速度合适
+   - 不撞机械限位
+
+第二步：视觉端发送固定角度
+   目标：
+   - 收到固定角后从 SCAN 切到 TRACK_ARMOR
+   - 云台稳定停在该角度附近
+
+第三步：视觉端周期改变目标角
+   目标：
+   - 云台可以稳定跟随
+   - 不发散
+   - 不明显抖动
+
+第四步：停止发送视觉目标
+   目标：
+   - 120ms 左右退出 TRACK_ARMOR
+   - 平滑回到扫描轨迹
+   - 恢复 SCAN
+
+第五步：再考虑加入 confidence / target_valid
+   这样状态切换会更靠谱
+
+
+五、第二部分：电机堵转回退
+----------------------------------------
+
+5.1 功能目标
+----------------------------------------
+
+堵转回退的目标不是“拿堵转来当作正常转向方式”，而是：
+
+1. 当电机明显被卡住时，尽快停止继续死顶
+2. 如果这个轴本身有机械限位，并且当前确实正在往限位方向顶
+   则允许小幅回退一次
+3. 如果不是机械限位附近，而是中途被阻挡、线材牵扯、外力按住
+   则不要来回硬顶，而应进入故障或冷却
+
+对本项目的建议是：
+
+1. pitch 轴
+   可以考虑启用“机械限位附近堵转回退”
+
+2. yaw 轴
+   当前不建议用“撞机械限位再回退”
+   yaw 更适合纯软件限位巡航，不适合靠堵转判断回头
+
+
+5.2 当前模块状态
+----------------------------------------
+
+当前堵转模块初稿文件如下：
+
+1. user_file/2_Device/Motor/dvc_motor_protect.h
+2. user_file/2_Device/Motor/dvc_motor_protect.c
+
+这一版模块已经具备：
+
+1. 通用堵转检测
+2. BACKOFF 状态
+3. COOLDOWN 状态
+4. FAULT 状态
+5. 开关配置
+6. 输出钳制接口
+
+但暂时还没有接进 Gimbal.c。
+
+这意味着：
+   目前模块可以单独看、单独审、单独接
+   但还没有真正接到 pitch 控制链里生效
+
+
+5.3 为什么堵转保护放成独立模块
+----------------------------------------
+
+原因是“哨兵扫描”和“堵转保护”虽然相关，但不是同一层逻辑。
+
+1. Gimbal 层负责：
+   - 扫描策略
+   - 目标生成
+   - 软限位
+   - 哪个轴允许回退
+   - 回退方向和回退目标角
+
+2. Motor protect 层负责：
+   - 判定是否堵转
+   - 进入 BACKOFF / COOLDOWN / FAULT
+   - 对输出进行钳制
+   - 发出“请求回退”的信号
+
+这种划分的好处：
+   - 电机保护逻辑可以复用
+   - 不把“哨兵模式”业务塞进 motor 驱动层
+   - pitch 和 yaw 可以共用一个保护器，但配置不同
+
+
+5.4 当前堵转模块的核心状态
+----------------------------------------
+
+一、MOTOR_PROTECT_STATE_NORMAL
+   正常运行状态
+   每一拍都进行堵转判定
+
+二、MOTOR_PROTECT_STATE_BACKOFF
+   已经确认堵转，并且允许执行回退
+   在这个状态下只允许小输出，防止继续死顶
+
+三、MOTOR_PROTECT_STATE_COOLDOWN
+   回退完成后进入冷却
+   此时输出一般被压成 0
+
+四、MOTOR_PROTECT_STATE_FAULT
+   进入故障状态
+   后续不再自动继续动作，必须由上层清故障
+
+
+5.5 当前堵转判定原则
+----------------------------------------
+
+当前模块使用四条件投票法：
+
+1. cmd 大
+2. torque 大
+3. speed 小
+4. pos_err 大
+
+满足其中 3 项以上，持续 confirm_ms，就判定堵转。
+
+这样做的理由：
+
+1. 只看电流/力矩会误判
+   因为某些快速加速、负载较大时，力矩本来就可能升高
+
+2. 只看速度太小也会误判
+   因为接近目标时速度本来就可能很低
+
+3. 只看位置误差大也会误判
+   因为大步进目标切换时误差天然会大
+
+把这几个条件组合起来会更稳。
+
+
+5.6 当前模块提供的配置项
+----------------------------------------
+
+主要配置结构体是：
+   Motor_Protect_Config_TypeDef
+
+核心字段说明：
+
+1. enable
+   总开关
+   0 表示关闭保护
+   1 表示启用保护
+
+2. allow_backoff
+   是否允许回退
+   对于 pitch 可开
+   对于 yaw 建议关
+
+3. has_mech_limit
+   当前轴是否存在机械限位
+   pitch 建议设为 1
+   yaw 建议设为 0
+
+4. cmd_th
+   命令阈值
+   输出命令超过这个值，才算明显在用力
+
+5. torque_th
+   力矩阈值
+   力矩反馈超过这个值，才算负载较大
+
+6. speed_th_rad_s
+   速度阈值
+   速度低于这个值，才算转不动
+
+7. err_th_deg
+   位置误差阈值
+   当前误差大于这个值，说明目标没跟上
+
+8. blank_ms
+   屏蔽窗口
+   在换向、切目标、刚恢复之后，一段时间内不判堵转
+
+9. confirm_ms
+   堵转确认时间
+   条件连续满足这么久，才真正判堵转
+
+10. backoff_ms
+   回退状态持续时间
+
+11. cooldown_ms
+   冷却时间
+
+12. retry_reset_ms
+   正常运行一段时间后，把 retry_count 清零
+
+13. backoff_cmd_limit
+   BACKOFF 状态下允许的最大命令幅度
+
+14. retry_limit
+   最多允许连续回退多少次
+   超过之后进入 FAULT
+
+
+5.7 当前模块提供的输入项
+----------------------------------------
+
+主要输入结构体是：
+   Motor_Protect_Input_TypeDef
+
+核心字段说明：
+
+1. dt_ms
+   当前控制周期时间，单位 ms
+
+2. pos_err_deg
+   当前位置误差，单位 deg
+   一般为：
+     target_angle - feedback_angle
+
+3. speed_rad_s
+   当前速度反馈，单位 rad/s
+
+4. cmd
+   当前控制命令
+   建议传“本拍实际输出给电机前的原始命令”
+
+5. torque_raw
+   电机反馈回来的力矩原始量
+
+6. near_limit
+   当前是否接近机械限位
+   这个值应由 Gimbal 层根据当前位置计算
+
+7. pushing_outward
+   当前命令方向是否还在继续把电机往限位外推
+   这个值也应由 Gimbal 层判定
+
+
+5.8 当前模块的标准调用方式
+----------------------------------------
+
+建议在每个 1ms 控制周期里按这个顺序调用：
+
+步骤 1：先准备保护器句柄和配置
+
+例如：
+
+   static Motor_Protect_Handle_TypeDef g_pitch_protect;
+   static const Motor_Protect_Config_TypeDef g_pitch_cfg = {
+       .enable = 1u,
+       .allow_backoff = 1u,
+       .has_mech_limit = 1u,
+       .cmd_th = 3500.0f,
+       .torque_th = 700.0f,
+       .speed_th_rad_s = 0.15f,
+       .err_th_deg = 2.5f,
+       .blank_ms = 120u,
+       .confirm_ms = 80u,
+       .backoff_ms = 120u,
+       .cooldown_ms = 200u,
+       .retry_reset_ms = 1000u,
+       .backoff_cmd_limit = 2500.0f,
+       .retry_limit = 2u,
+   };
+
+步骤 2：每拍计算保护输入
+
+   Motor_Protect_Input_TypeDef in;
+   in.dt_ms = 1u;
+   in.pos_err_deg = pitch_target - pitch_feedback;
+   in.speed_rad_s = Gimbal_Motor_Pitch.RxData.Speed;
+   in.cmd = pitch_output_raw;
+   in.torque_raw = Gimbal_Motor_Pitch.RxData.Torque;
+   in.near_limit = pitch_near_limit;
+   in.pushing_outward = pitch_pushing_outward;
+
+步骤 3：调用更新
+
+   Motor_Protect_Update(&g_pitch_protect, &g_pitch_cfg, &in);
+
+步骤 4：如果有回退请求，则让 Gimbal 层改目标角
+
+   if (Motor_Protect_Consume_Backoff_Request(&g_pitch_protect) != 0u)
+   {
+       清 pitch PID 积分;
+       设置一个小幅反向回退目标角;
+   }
+
+步骤 5：在最终发给电机前做输出钳制
+
+   pitch_output = Motor_Protect_Apply_Output(&g_pitch_protect,
+                                             &g_pitch_cfg,
+                                             pitch_output_raw);
+
+步骤 6：如果进入故障，则等待人工清除或上层逻辑清除
+
+   if (Motor_Protect_Is_Fault(&g_pitch_protect) != 0u)
+   {
+       停止继续输出;
+   }
+
+
+5.9 为什么 BACKOFF 只做“请求”和“限幅”，不直接决定方向
+----------------------------------------
+
+当前模块的设计里，BACKOFF 只负责：
+
+1. 报告“需要回退”
+2. 把输出钳制到较小范围
+
+它不直接决定：
+
+1. 回退朝哪个方向
+2. 回退角度是多少
+3. 回退目标是角度还是速度
+
+原因是这些信息只有 Gimbal 层最清楚：
+
+1. 哪个轴有机械限位
+2. 当前轴的正方向定义
+3. 当前轴是角度环还是速度环
+4. 当前轴的机械结构和线束方向
+
+所以正确做法是：
+   motor protect 发“请求”
+   gimbal 层根据轴语义把请求翻译成真正的回退目标
+
+
+5.10 推荐的轴配置
+----------------------------------------
+
+基于当前项目的建议如下：
+
+一、pitch 轴
+   enable = 1
+   allow_backoff = 1
+   has_mech_limit = 1
+
+说明：
+   pitch 有机械限位，适合在接近限位并继续外推时启用小幅回退。
+
+二、yaw 轴
+   enable = 1
+   allow_backoff = 0
+   has_mech_limit = 0
+
+说明：
+   yaw 不应依赖撞机械限位作为正常回头方式。
+   yaw 更适合软件限位扫描，如果中途异常，则停机或进入故障。
+
+
+5.11 堵转回退的推荐阈值起点
+----------------------------------------
+
+以下只是建议起点，不是最终标准：
+
+pitch:
+   cmd_th = 3500 ~ 5000
+   torque_th = 600 ~ 1000
+   speed_th_rad_s = 0.10 ~ 0.20
+   err_th_deg = 2.0 ~ 4.0
+   confirm_ms = 50 ~ 120
+   backoff_ms = 80 ~ 150
+   cooldown_ms = 150 ~ 300
+
+yaw:
+   如果只是做保护而不做回退，可适当放宽：
+   cmd_th = 4000 ~ 6000
+   torque_th = 700 ~ 1200
+   speed_th_rad_s = 0.10 ~ 0.25
+   err_th_deg = 3.0 ~ 5.0
+
+实际调法建议：
+
+1. 先记录正常运动时的 cmd / torque / speed / err
+2. 再记录人为堵住时的数据
+3. 用两组数据之间的空隙选阈值
+4. 不要拍脑袋直接写死
+
+
+5.12 推荐的上板调试顺序
+----------------------------------------
+
+第一步：先只开检测，不开回退
+   即：
+   enable = 1
+   allow_backoff = 0
+
+先观察：
+   - 正常动作会不会误报堵转
+   - 真的卡住时能不能稳定进入故障
+
+第二步：只给 pitch 开回退
+   yaw 仍然保持不回退
+
+第三步：把回退动作做小
+   先退 1 到 2 度
+   不要一开始退很多
+
+第四步：确认回退方向正确
+   这个非常重要
+   如果方向反了，回退就会变成继续撞限位
+
+第五步：确认连续堵转会进入 FAULT
+   避免一直来回震荡
+
+
+5.13 建议接入 Gimbal 的具体方式
+----------------------------------------
+
+当前最推荐的接法是：
+
+1. 在 Gimbal.c 顶部定义：
+   - pitch protect handle
+   - pitch protect config
+
+2. 在 Gimbal_Init() 里：
+   调 Motor_Protect_Init()
+
+3. 在 Gimbal_Motor_Control_ALL_Test() 里：
+   在 pitch_output 计算出来之后、发送 CAN 之前：
+   - 计算 near_limit
+   - 计算 pushing_outward
+   - 组织 protect input
+   - 调 Motor_Protect_Update()
+   - 如果请求回退，则改 g_gimbal_pitch_target
+   - 最终用 Motor_Protect_Apply_Output() 处理输出
+
+4. 在 pitch 的回退触发时：
+   一定要清 pitch 两级 PID 积分
+
+不建议的接法：
+   直接在 dvc_motor.c 里面根据 Torque 大小做“自动反转”
+
+因为那样：
+   - 看不到云台层的目标角
+   - 看不到是不是接近机械限位
+   - 不知道当前方向定义
+   - 容易把业务逻辑写脏
+
+
+5.14 当前堵转模块的边界
+----------------------------------------
+
+这部分一定要明确：
+
+1. 当前模块还没有真正接到 Gimbal 控制链
+   所以现在不会自动触发 pitch 回退
+
+2. 当前模块也没有帮你清 PID 积分
+   这个动作必须由 Gimbal 层在收到回退请求后自己做
+
+3. 当前模块不会自己改变目标角
+   它只会告诉你“需要回退了”
+
+4. 当前模块不会自动决定回退方向
+   方向必须由 Gimbal 层按 pitch 的正方向定义来处理
+
+5. 当前模块不会自己判断视觉状态机
+   它只关心电机是否疑似堵转
+
+
+六、这两个功能一起使用时的建议
+----------------------------------------
+
+推荐运行顺序如下：
+
+1. 先把视觉扫描 + 跟随调通
+   先确保：
+   - SCAN 正常
+   - TRACK_ARMOR 正常
+   - LOST_TARGET_RETURN_SCAN 正常
+
+2. 再给 pitch 接入堵转保护
+   先只做检测，不做回退
+
+3. 最后给 pitch 开回退
+   并且限制为：
+   - 只有 near_limit = 1
+   - 且 pushing_outward = 1
+   时才允许回退
+
+不要一开始就把“视觉跟随 + pitch 回退 + yaw 回退”一起全打开。
+那样一旦动作不对，很难判断到底是哪一层的问题。
+
+
+七、最常见问题
+----------------------------------------
+
+问题 1：为什么视觉明明发值了，云台不跟随？
+
+排查顺序：
+1. 先看 USB 是否在线
+2. 再看视觉发的帧头帧尾是否正确
+3. 再看 Pitch/Yaw 是否在合法范围内
+4. 再看视觉发的是绝对角还是偏差角
+5. 再看 Gimbal 是否已经进入 TRACK_ARMOR
+
+
+问题 2：为什么丢目标后不回扫？
+
+排查顺序：
+1. 看视觉是否仍在持续发旧值
+2. 看 Manifold_USB_Rx_Frame_Seq 是否还在增加
+3. 看 timeout 是否设置得太大
+
+
+问题 3：为什么 pitch 老是误报堵转？
+
+排查顺序：
+1. cmd_th 是否太低
+2. torque_th 是否太低
+3. speed_th 是否太高
+4. confirm_ms 是否太短
+5. blank_ms 是否太短
+
+
+问题 4：为什么回退方向不对？
+
+原因通常是：
+1. pitch 正方向和你想象的不一致
+2. pushing_outward 判定反了
+3. near_limit 逻辑写对了，但回退目标写反了
+
+
+八、后续建议
+----------------------------------------
+
+建议后续升级的方向如下：
+
+1. 视觉协议升级
+   增加：
+   - target_valid
+   - confidence
+   - armor_id
+   - target_lost
+
+2. 状态机升级
+   增加：
+   - TRACK_CONFIRM
+   - LOST_HOLD
+   - RETURN_HOME
+
+3. 堵转保护升级
+   增加：
+   - 故障码
+   - 每轴统计计数
+   - VOFA 调试输出
+   - 与视觉状态机联动
+
+4. pitch 回退策略升级
+   可从“命令限幅回退”升级为“固定小角度回退”
+
+
+九、结论
+----------------------------------------
+
+当前工程已经具备：
+
+1. 上下左右扫描
+2. 识别到装甲板后切换跟随
+3. 丢目标后回到扫描轨迹
+
+当前工程尚未完全打通：
+
+1. pitch 机械限位堵转回退的正式接线
+
+但已经具备可复用的保护模块初稿：
+
+1. motor protect 状态机
+2. 堵转检测
+3. BACKOFF / COOLDOWN / FAULT
+4. 输出钳制
+5. 回退请求接口
+
+建议你当前先按以下顺序推进：
+
+1. 把视觉扫描和跟随在上板上调顺
+2. 确认视觉发的是绝对角还是偏差角
+3. 再把 pitch 的堵转回退接进 Gimbal.c
+4. 只给 pitch 开回退，yaw 不开
+
+
+十、附录：一句话记忆版
+----------------------------------------
+
+视觉扫描跟随：
+   没目标就扫，识别到就跟，丢了先回轨迹再继续扫。
+
+堵转回退：
+   先判堵转，再卸力，只有 pitch 且靠近机械限位时才小回退，其他情况直接冷却或故障。

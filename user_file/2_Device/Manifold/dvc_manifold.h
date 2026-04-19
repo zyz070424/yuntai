@@ -5,7 +5,16 @@
 #include "alg_quaternion.h"
 #include <stdint.h>
 
-#define MANIFOLD_USB_FRAME_LEN_V2     (1u + sizeof(float) + sizeof(float) + 1u)
+/**
+ * @brief 视觉发给电控的接收帧长度。
+ * @note  协议固定为 [Frame_Header][Yaw][Pitch][Target_Valid][Frame_Tail]。
+ */
+#define MANIFOLD_USB_RX_FRAME_LEN     (1u + sizeof(float) + sizeof(float) + 1u + 1u)
+/**
+ * @brief 电控发给视觉的发送帧长度。
+ * @note  本次改造只调整接收协议，发送协议仍保持 [Frame_Header][Yaw][Pitch][Frame_Tail]。
+ */
+#define MANIFOLD_USB_TX_FRAME_LEN     (1u + sizeof(float) + sizeof(float) + 1u)
 #define MANIFOLD_USB_RX_DEBUG_RAW_MAX USB_BUFFER_SIZE
 /**
  * @brief 视觉Manifold状态
@@ -60,39 +69,51 @@ enum Enum_Manifold_Sentry_Mode
  */
 
 
-typedef struct 
+/**
+ * @brief 视觉发给电控的目标数据缓存。
+ * @note  线上协议字节布局固定为 [Header][Yaw][Pitch][Target_Valid][Tail]，
+ *        解析时必须按协议偏移读取，不能依赖结构体内存布局。
+ */
+typedef struct
 {
-    uint8_t Frame_Header;//帧头
-    uint8_t Frame_Tail;//帧尾    
-    float Taget_Pitch; //目标俯仰角
-    float Taget_Yaw;   //目标偏航角
+    uint8_t Frame_Header; // 帧头
+    float Taget_Yaw;      // 目标偏航角（绝对角）
+    float Taget_Pitch;    // 目标俯仰角（绝对角）
+    uint8_t Target_Valid; // 目标是否有效：0=无目标，非0=有目标
+    uint8_t Frame_Tail;   // 帧尾
     // euler_t Taget_Angle; //目标欧拉角
     // uint8_t Shoot_Flag; //
     // enum Enum_Manifold_Enemy_ID Enemy_ID;//敌方机器人ID
     // uint16_t Confidence_Level;//置信度
-}Manifold_UART_Rx_Data;
+} Manifold_UART_Rx_Data;
 
 /**
  * @brief 控制板给视觉Manifold的源数据
  *
  */
-typedef struct 
+/**
+ * @brief 电控发给视觉的姿态数据缓存。
+ * @note  发送协议仍保持 [Header][Yaw][Pitch][Tail]，不携带 Target_Valid。
+ */
+typedef struct
 {
-    uint8_t Frame_Header;//帧头
-    uint8_t Frame_Tail;//帧尾
-    float Pitch; //俯仰角
-    float Yaw;   //偏航角
-}Manifold_UART_Tx_Data;
+    uint8_t Frame_Header; // 帧头
+    float Yaw;            // 偏航角
+    float Pitch;          // 俯仰角
+    uint8_t Frame_Tail;   // 帧尾
+} Manifold_UART_Tx_Data;
 
 // 函数声明
-extern volatile uint8_t Manifold_USB_Tx_Debug_Frame[MANIFOLD_USB_FRAME_LEN_V2];
+extern volatile uint8_t Manifold_USB_Tx_Debug_Frame[MANIFOLD_USB_TX_FRAME_LEN];
 extern volatile uint16_t Manifold_USB_Tx_Debug_Len;
 extern volatile uint8_t Manifold_USB_Rx_Debug_Raw[MANIFOLD_USB_RX_DEBUG_RAW_MAX];
 extern volatile uint16_t Manifold_USB_Rx_Debug_Raw_Len;
-extern volatile uint8_t Manifold_USB_Rx_Debug_Frame[MANIFOLD_USB_FRAME_LEN_V2];
+extern volatile uint8_t Manifold_USB_Rx_Debug_Frame[MANIFOLD_USB_RX_FRAME_LEN];
 extern volatile uint16_t Manifold_USB_Rx_Debug_Frame_Len;
+extern volatile uint32_t Manifold_USB_Rx_Frame_Seq;
 
 void Manifold_Init(Manifold_UART_Tx_Data* data, uint8_t Frame_Header, uint8_t Frame_End, enum Enum_Manifold_Sentry_Mode Sentry_Mode);
+void Manifold_Clear_Target(void);
 /**
  * @brief manifold USB 接收回调函数
  * @note  非官方
